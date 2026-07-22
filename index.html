@@ -114,9 +114,9 @@ a.dl{display:block;text-align:center;margin-top:10px;color:var(--purple);font-we
   <div id="pos">0:00</div>
   <canvas id="wave"></canvas>
   <div class="legend">
-    <span><i style="background:#7fd4c1"></i>Repeated phrase</span>
-    <span><i style="background:#4a4266"></i>Vocal line</span>
-    <span><i style="background:#ffb84d"></i>Ad-lib / DJ tag</span>
+    <span><i style="background:#4a4266"></i>Vocal line heard</span>
+    <span><i style="background:#7fd4c1"></i>Line that repeats</span>
+    <span><i style="background:#ffb84d"></i>Ad-lib &middot; DJ tag</span>
   </div>
   <div class="hint" id="waveHint">Tap the wave to jump. Chop markers can be dragged.</div>
 </div>
@@ -1208,10 +1208,31 @@ function applyLyrics(){
         phrases[best].text=(phrases[best].text?phrases[best].text+' ':'')+lyricLines[i].text;
     }
   }else{
-    var step=phrases.length/lyricLines.length;
-    for(i=0;i<lyricLines.length;i++){
-      var idx=Math.min(phrases.length-1,Math.round(i*step));
-      phrases[idx].text=(phrases[idx].text?phrases[idx].text+' ':'')+lyricLines[i].text;
+    /* no timestamps — align by syllable weight. Each line gets an estimated
+       syllable count (vowel groups); walk lines and phrases together so the
+       cumulative syllable fractions track each other. Far better than even
+       spacing, because ad-libs are short and verse lines are long. */
+    function lineSyl(t2){
+      var m=t2.toLowerCase().replace(/[^a-z ]/g,'').match(/[aeiouy]+/g);
+      return m?Math.max(1,m.length):1;
+    }
+    if(lyricLines.length===phrases.length){
+      /* counts match — the lines ARE the phrases, map one to one */
+      for(i=0;i<lyricLines.length;i++)phrases[i].text=lyricLines[i].text;
+    }else{
+      var lineTot=0,phTot=0;
+      var lineS=[];
+      for(i=0;i<lyricLines.length;i++){var ls=lineSyl(lyricLines[i].text);lineS.push(ls);lineTot+=ls;}
+      for(i=0;i<phrases.length;i++)phTot+=phrases[i].syl;
+      var lineCum=0,phCum=0,pi2=0;
+      for(i=0;i<lyricLines.length;i++){
+        var targetFrac=(lineCum+lineS[i]*0.5)/Math.max(1,lineTot);
+        while(pi2<phrases.length-1&&(phCum+phrases[pi2].syl)/Math.max(1,phTot)<targetFrac){
+          phCum+=phrases[pi2].syl;pi2++;
+        }
+        phrases[pi2].text=(phrases[pi2].text?phrases[pi2].text+' ':'')+lyricLines[i].text;
+        lineCum+=lineS[i];
+      }
     }
   }
   var freq={};
@@ -1241,10 +1262,13 @@ function loadLyricFile(f){
     if(!lyricLines.length){setStatus('No lines found in that file.');return;}
     if(!phrases.length){setStatus('Loaded '+lyricLines.length+' lines. Load a song and they will be aligned.');return;}
     applyLyrics();
-    var named=0;
-    for(var i=0;i<phrases.length;i++)if(phrases[i].text)named++;
-    setStatus('Matched '+named+' of '+phrases.length+' vocal phrases to lyrics. Rebuilding chops.');
-    if(buf)autoChop();
+    var named=0,adl2=0;
+    for(var i=0;i<phrases.length;i++){if(phrases[i].text)named++;if(phrases[i].adlib)adl2++;}
+    setStatus('Lyrics in: '+named+' of '+phrases.length+' phrases matched'+(adl2?', '+adl2+' ad-libs found':'')+'. Rebuilding chops.');
+    $('lyricHint').textContent=lyricLines[0].t>=0
+      ?'Timestamped lyrics loaded — matched phrases show taller on the wave.'
+      :'Plain text has no timestamps, so lines were aligned by syllable weight — decent, not exact. An .lrc file with [mm:ss] stamps aligns perfectly.';
+    if(buf){drawWave();autoChop();}
   };
   rd.onerror=function(){setStatus("Couldn't read that lyric file.");};
   rd.readAsText(f);
@@ -1375,7 +1399,8 @@ function drawWave(playT){
     var px=ph.a/dur*w, pw=Math.max(1,(ph.b-ph.a)/dur*w);
     g.fillStyle=ph.adlib?'#ffb84d':(ph.rep>0?'#7fd4c1':'#4a4266');
     g.globalAlpha=0.45+ph.score*0.55;
-    g.fillRect(px,4,pw,3);
+    /* phrases with lyric text attached draw taller — you can see the import */
+    g.fillRect(px,4,pw,ph.text?5:3);
     g.globalAlpha=1;
   }
   /* bar grid every 4 bars */
@@ -1596,13 +1621,14 @@ function autoChop(){
      A long song simply has more sections and therefore more chops. */
   function secBudget(sec){
     var base;
-    if(sec.type==='hook')base=clamp(Math.round(sec.bars/2.2),4,8);
-    else if(sec.type==='verse')base=clamp(Math.round(sec.bars/3.6),3,6);
-    else if(sec.type==='unknown')base=clamp(Math.round(sec.bars/4.5),2,4);
-    else if(sec.type==='inst')base=clamp(Math.round(sec.bars/6),1,3);
+    /* ceilings grow with section length — a 40-bar verse is not an 8-bar verse */
+    if(sec.type==='hook')base=clamp(Math.round(sec.bars/2.2),4,Math.max(8,Math.round(sec.bars/2.5)));
+    else if(sec.type==='verse')base=clamp(Math.round(sec.bars/3.6),3,Math.max(6,Math.round(sec.bars/3)));
+    else if(sec.type==='unknown')base=clamp(Math.round(sec.bars/4),2,Math.max(4,Math.round(sec.bars/4)));
+    else if(sec.type==='inst')base=clamp(Math.round(sec.bars/6),1,Math.max(3,Math.round(sec.bars/6)));
     else return 0;
     var b2=Math.round(base*density);
-    return clamp(b2,density<0.7?0:1,sec.type==='hook'?Math.round(8*Math.max(1,density)):Math.round(6*Math.max(1,density)));
+    return clamp(b2,density<0.7?0:1,Math.round(base*Math.max(1,density)));
   }
   var picked=[]; secChopCount={};
   for(var si=0;si<sections.length;si++){
@@ -1696,6 +1722,21 @@ function autoChop(){
   out2.sort(function(a,b){return a.t-b.t;});
   picked=out2;
   picked.sort(function(a,b){return a.t-b.t;});
+  /* top-up: if the take came out sparse (long sections, strict gates, drops
+     along the way), pull the best remaining candidates back in — still
+     respecting spacing, the per-bar cap, and vocal distance */
+  var wantMin=Math.max(4,Math.round(buf.duration/22*density));
+  if(picked.length<wantMin&&bench.length){
+    bench.sort(function(a,b){return b.raw-a.raw;});
+    for(var tb=0;tb<bench.length&&picked.length<wantMin;tb++){
+      var cnd=bench[tb], ok2=true;
+      for(var pc=0;pc<picked.length;pc++){
+        if(Math.abs(picked[pc].bar-cnd.bar)<2){ok2=false;break;}
+        if(cnd.cat==='vocal'&&picked[pc].cat==='vocal'&&Math.abs(picked[pc].t-cnd.t)<majorGap){ok2=false;break;}
+      }
+      if(ok2){picked.push(cnd);picked.sort(function(a,b){return a.t-b.t;});}
+    }
+  }
   /* taste still nudges the whole take */
   if(taste.autoDeletes>=3&&taste.autoDeletes>taste.manualAdds&&picked.length>4){
     picked.sort(function(a,b){return b.raw-a.raw;});
@@ -2621,7 +2662,10 @@ $('edDel').addEventListener('click',function(){
   chops.splice(selIdx,1);closeEditor();updateChopCount();
 });
 $('lyricBtn').addEventListener('click',function(){$('lyricFile').click();});
-$('lyricFile').addEventListener('change',function(e){loadLyricFile(e.target.files[0]);});
+$('lyricFile').addEventListener('change',function(e){
+  loadLyricFile(e.target.files[0]);
+  e.target.value='';   /* so picking the same file again still fires */
+});
 $('tagUpBtn').addEventListener('click',function(){getCtx();$('tagFile').click();});
 $('tagFile').addEventListener('change',function(e){handleTagFiles(e.target.files);});
 $('tagRecBtn').addEventListener('click',function(){getCtx();toggleRec();});
