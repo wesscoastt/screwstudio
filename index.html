@@ -314,6 +314,7 @@ var aiFx=true;
 var anMono=null,anVBand=null,anSBand=null,anHat=null,anSub=null,anSr=44100;
 var beatKick=null, beatSnare=null, beatHat=null, beatStab=null, barFill=null, barDrop=null, secChopCount={};
 var barChroma=null, barDrum=null, barBassSeq=null;
+var beatMoment=null;   /* how natural a cut at each beat looks in the waveform */
 var sections=[];               /* {a,b,type,energy,vocal} bar indices */
 var derivedSpeed=0.65, speed=0.65, preservePitch=false;
 var chops=[], undoStack=[], selIdx=-1;
@@ -367,7 +368,7 @@ var fx={
    gap    minimum seconds between major vocal chops
    arc    how hard the tension arc is shaped */
 var STYLES={
-  classic:{name:'Classic Screw',    dens:0.85,voc:1.05,beat:1.0, flip:1.15,big:0.9, rpt:0.8, fire:1.0, gap:14,arc:1.0},
+  classic:{name:'Classic Screw',    dens:1.00,voc:1.05,beat:1.0, flip:1.15,big:0.9, rpt:0.8, fire:1.0, gap:14,arc:1.0},
   barend: {name:'Bar End Punchlines',dens:1.0, voc:1.35,beat:0.75,flip:0.9, big:0.8, rpt:1.0, fire:1.9, gap:11,arc:0.9},
   drums:  {name:'Drum Driven',      dens:1.15,voc:0.55,beat:1.6, flip:1.35,big:1.15,rpt:0.9, fire:0.7, gap:16,arc:1.1},
   vocal:  {name:'Vocal Heavy',      dens:1.05,voc:1.75,beat:0.6, flip:0.75,big:0.85,rpt:1.15,fire:1.35,gap:9, arc:0.9},
@@ -770,6 +771,37 @@ function analyzeAll(){
     barFill[bi]=(pv>0.05&&barFill[bi]>pv*1.55)?clamp((barFill[bi]/pv-1),0,1):0;
   }
   if(nb>0){barFill[0]=0;if(nb>1)barFill[1]=0;if(nb>2)barFill[2]=0;}
+
+  /* 5c-2. the waveform itself.
+     The grid says where a beat is; it does not say where a cut will sound
+     natural. Those moments are visible in the shape of the wave: the level
+     jumping, a sub hit landing, a sharp attack, a vocal peaking, or a pocket
+     of quiet just before. Score every beat on what the wave is doing there. */
+  setStatus('Studying the waveform...');
+  beatMoment=new Float32Array(nBeats);
+  var mWin=Math.floor(sr*0.055);
+  for(bt=0;bt<nBeats;bt++){
+    var c3=Math.floor(beats[bt]*sr);
+    var pA=Math.max(0,c3-mWin*3), pB=Math.max(0,c3-mWin);
+    var nA=c3, nB=Math.min(n,c3+mWin);
+    if(nB<=nA)continue;
+    var before=rmsRange(mono,pA,pB,4), after=rmsRange(mono,nA,nB,4);
+    var jump=clamp((after-before)/(before+0.02),0,1);            /* level lifts */
+    var subHit=(bt<beatKick.length)?beatKick[bt]:0;              /* bass landing */
+    var attack=(bt<beatSnare.length)?Math.max(beatSnare[bt],beatHat[bt]*0.6):0;
+    /* a vocal peaking right here */
+    var vp=0;
+    if(vocEnv&&vocRate){
+      var f3=Math.floor(beats[bt]*vocRate);
+      if(f3>1&&f3<vocEnv.length-1){
+        var loc3=vocEnv[f3], pre3=vocEnv[f3-1];
+        vp=clamp((loc3-pre3)*3,0,1)*clamp(loc3*1.5,0,1);
+      }
+    }
+    /* a pocket of quiet immediately before is the clearest invitation there is */
+    var hush=clamp(1-before/0.06,0,1);
+    beatMoment[bt]=clamp(jump*0.30+subHit*0.22+attack*0.22+vp*0.16+hush*0.20,0,1);
+  }
 
   /* 5d. per-bar repetition signatures — the raw material for multi-signal
      section matching. Chroma = harmony, drum grid = rhythm, bass shape = groove. */
@@ -2160,6 +2192,10 @@ function autoChop(quiet){
     return 0.3;                                 /* calm */
   }
   for(i=0;i<cands.length;i++){
+    /* what the waveform says about this exact moment */
+    var bmi=beatIndexAt(cands[i].t);
+    cands[i].moment=(beatMoment&&bmi<beatMoment.length)?beatMoment[bmi]:0.5;
+    cands[i].raw*=(0.75+cands[i].moment*0.5);
     var ac=arcAt(cands[i].bar);
     cands[i].arc=ac;
     /* the style's instincts bend the whole candidate map */
@@ -2497,7 +2533,15 @@ function autoChop(quiet){
   for(i=0;i<keys.length;i++){
     var sa=+keys[i];
     for(var s3=0;s3<sections.length;s3++){
-      if(sections[s3].a===sa&&(sections[s3].type==='verse'||sections[s3].type==='inst'))restable.push(sa);
+      if(sections[s3].a!==sa)continue;
+      if(sections[s3].type!=='verse'&&sections[s3].type!=='inst')continue;
+      /* never rest the last musical section — the mix has to finish on
+         something, and a rest there just sounds like it ran out */
+      var isLast=true;
+      for(var s4=s3+1;s4<sections.length;s4++)
+        if(sections[s4].type!=='outro')isLast=false;
+      if(isLast)continue;
+      restable.push(sa);
     }
   }
   if(restable.length>=1&&keys.length>=4&&draft.length>=12&&rnd()<0.55){
@@ -2605,6 +2649,7 @@ function autoChop(quiet){
   }
   lastTally=tally; lastRest=restedSection;
   critiqueChops();
+  reviewLoop();
   if(quiet)return;
   validateChops();
   scoreMix();
@@ -2680,6 +2725,7 @@ function writeReport(picked){
     for(i=0;i<lastTourney.length;i++)tl.push(lastTourney[i].label+' '+lastTourney[i].score);
     line('Built five mixes and kept the best one: '+tl.join(', ')+'. Winner: '+lastWinner+'. Remix to run the five again with new decisions.');
   }
+  if(lastReview.kept)line('Worked through the take one chop at a time, the way a DJ would: each one placed, listened to against everything already down, then kept, reworked or dropped. '+(lastReview.revised?lastReview.revised+' were reworked'+(lastReview.moved?' ('+lastReview.moved+' moved to a later beat so the line could finish first)':''):'')+(lastReview.revised&&lastReview.dropped?', ':'')+(lastReview.dropped?lastReview.dropped+' did not earn their place':'')+'.');
   if(lastValid.removed||lastValid.repaired)line('Validation pass scored every chop out of 100 on groove, timing, phrasing, drum alignment, impact and naturalness — including whether the splice would click. '+(lastValid.repaired?lastValid.repaired+' were repaired (re-snapped, shortened, or fewer repeats)':'')+(lastValid.repaired&&lastValid.removed?' and ':'')+(lastValid.removed?lastValid.removed+' could not reach 85 and were removed':'')+'.');
   else if(chops.length)line('Every chop cleared the 85 mark on all six axes first time.');
   if(lastCrit.removed||lastCrit.adjusted)line('Second pass reviewed every chop like a DJ listening back: '+(lastCrit.removed?lastCrit.removed+' cut for crowding or dirty edges':'')+(lastCrit.removed&&lastCrit.adjusted?', ':'')+(lastCrit.adjusted?lastCrit.adjusted+' adjusted (re-snapped, shortened, or varied)':'')+'. Only what survived review made the mix.');
@@ -2692,6 +2738,7 @@ function writeReport(picked){
   if(unkN)line('Where the structure signals didn\'t fully agree I chopped gently instead of guessing.');
   line('Every chop cleared at least two musical tests: drum accent, memorable lyric, phrase fit, groove, or transition. One reason is a coincidence — two is a chop.');
   if(gridDrift.moved>beats.length*0.15)line('This recording drifts — the beat grid was pulled onto the real hits rather than assuming a fixed '+bpm+' BPM, so chops late in the song land as tight as the ones at the start.');
+  line('Chop points come from the waveform, not just the count: level jumps, sub hits, drum attacks, vocal peaks and the pockets of quiet between phrases all mark where a cut sounds natural.');
   line('Timing is exact: every chop sits dead on a beat and every repeat is a clean beat multiple, with a click-free fade on both ends of the splice.');
   var fromPh=0,adl=0,rep=0;
   for(i=0;i<picked.length;i++){
@@ -2743,6 +2790,36 @@ function seamLevel(t){
   for(i=c;i<c+w;i++)post+=anMono[i]*anMono[i];
   return {pre:Math.sqrt(pre/w),post:Math.sqrt(post/w)};
 }
+/* ---- listening to the splice ----
+   A repeat only sounds deliberate if the material it throws back BEGINS with
+   something — a hit, an attack, a word starting. Repeat a chunk that starts
+   halfway through a held note and the ear hears a skipping record, not a DJ.
+   Equally, the material has to END somewhere the song could plausibly stop.
+   Both are measurable in the wave, so measure them instead of assuming. */
+function articulation(t){
+  if(!anMono||!anSr)return 0.5;
+  var c=Math.floor(t*anSr), w=Math.floor(anSr*0.03);
+  if(c-w*2<0||c+w>=anMono.length)return 0.5;
+  var before=rmsRange(anMono,c-w*2,c-Math.floor(w*0.3),3);
+  var after=rmsRange(anMono,c,c+w,3);
+  /* An attack is quiet then loud; a sustain is loud then just as loud. In a
+     dense mix the gap between those is small — the record never actually goes
+     silent — so the raw ratio has to be opened up or every honest attack reads
+     as a sustain and the take gets gutted. */
+  var raw=(after-before)/(after+0.015);
+  return clamp(raw*2.4,0,1);
+}
+function restingPoint(t){
+  /* does the material end somewhere the song could breathe */
+  if(!anMono||!anSr)return 0.5;
+  var c=Math.floor(t*anSr), w=Math.floor(anSr*0.03);
+  if(c-w<0||c+w>=anMono.length)return 0.5;
+  var pre=rmsRange(anMono,c-w,c,3), post=rmsRange(anMono,c,c+w,3);
+  /* falling away, or a fresh attack starting — either is a clean place to cut */
+  var falling=clamp((pre-post)/(pre+0.015),0,1);
+  var fresh=clamp((post-pre)/(post+0.015),0,1);
+  return clamp(Math.max(falling,fresh)+0.25,0,1);
+}
 function seamRisk(c){
   /* the two joins a repeat makes: into the repeat, and back out of it */
   var u=(c.mode==='flip'?1:c.unit)*localBeatLen(c.t);
@@ -2778,6 +2855,11 @@ function validateChop(c,idx,sorted){
   var tight=Math.min(gapPrev,gapNext);
   ax.groove=clamp((tight-ext)/(barLen()*1.2),0,1);
   if(tight>barLen()*16)ax.groove*=0.85;              /* stranded on its own */
+  /* --- what the splice actually sounds like, read off the waveform --- */
+  var uLen=(c.mode==='flip'?1:c.unit)*bl;
+  var art=articulation(c.t-uLen);        /* does the repeat begin with something */
+  var rest=restingPoint(c.t);            /* does it end somewhere it could */
+  c.artic=art;
   /* --- musical impact: is this a moment worth repeating --- */
   var bar=barIndexAt(c.t);
   var eHere=(barEnergy&&bar<barEnergy.length)?barEnergy[bar]:0.5;
@@ -2789,7 +2871,7 @@ function validateChop(c,idx,sorted){
   /* the axes are scaled so a competent chop reads about 0.85 and only a
      genuinely weak one falls below. Confidence is a percentile, so on its own
      it can never average high — it informs the score, it does not define it. */
-  ax.impact=clamp(0.55+cf2*0.25+clamp(eHere,0,1)*0.10+clamp(rise*2.5,0,1)*0.10+(c.fire||0)*0.15,0,1);
+  ax.impact=clamp(0.55+cf2*0.22+clamp(eHere,0,1)*0.09+clamp(rise*2.5,0,1)*0.09+(c.fire||0)*0.13+art*0.12,0,1);
   /* --- naturalness: no clicks, sane repeat count, musical material length --- */
   var risk=seamRisk(c);
   /* one or two throws is the house style; three is a choice; four is a stunt.
@@ -2803,7 +2885,18 @@ function validateChop(c,idx,sorted){
   }
   var unitOk=(c.mode==='flip')||[0.25,0.5,1,2,4].indexOf(c.unit)>=0;
   /* a splice always moves the level a little — only a real jump is a click */
-  ax.natural=clamp((unitOk?1:0.5)-clamp(risk-0.35,0,1)*0.75-cntPenalty,0,1);
+  /* Scaling every chop by how articulated it is punishes honest ones for the
+     sake of catching a few bad ones. Only a repeat that genuinely starts in
+     the middle of a held note deserves the penalty — that is the one that
+     sounds like a skipping record rather than a DJ. */
+  var listen=clamp(art*0.62+rest*0.38,0,1);
+  /* a quarter or half beat stutter is supposed to sound like a fragment —
+     that is the effect. The glitch rule is about repeating a whole beat or bar
+     that begins in the middle of a held note. */
+  var shortMat=(c.mode!=='flip'&&c.unit<=0.5);
+  var glitch=shortMat?1:((art<0.14&&rest<0.55)?0.62:(art<0.14?0.82:1));
+  ax.natural=clamp(((unitOk?1:0.5)-clamp(risk-0.35,0,1)*0.75-cntPenalty)*glitch,0,1);
+  c.listen=listen;
   var mean=(ax.timing*0.20+ax.drum*0.18+ax.phrasing*0.22+
             ax.groove*0.14+ax.impact*0.14+ax.natural*0.12)*100;
   /* A weighted average lets a chop coast: brilliant on five counts and
@@ -2849,6 +2942,7 @@ function validateChops(){
 /* ---- mix score: what the critic thinks of the finished take ---- */
 var mixScore={total:0,notes:[],weak:[]};
 var lastValid={removed:0,repaired:0}, lastWinner='';
+var lastReview={revised:0,dropped:0,moved:0,kept:0};
 function scoreMix(){
   var i,n=chops.length;
   if(!n){mixScore={total:0,notes:[],weak:[]};return;}
@@ -2955,6 +3049,239 @@ function optimizeMix(){
   scoreMix();
   updateChopCount();drawWave();renderMixScore();
   setStatus('Optimized: '+fixed+' chop'+(fixed===1?'':'s')+' fixed or removed ('+before+' \u2192 '+chops.length+'), mix now '+mixScore.total+'/100.');
+}
+/* ---------------- the review loop ----------------
+   A batch pass judges a finished take. A DJ works differently: place a chop,
+   listen to it in the context of everything already placed, decide whether it
+   earned its spot, adjust it or drop it, then move on. Each decision is made
+   knowing what came before, which is what makes a take feel considered rather
+   than generated. */
+function chopVariants(c){
+  /* the same moment, treated different ways */
+  var out=[c], i, alt;
+  var swap={b1:['h2','b2'],h2:['q4','b1'],b2:['b1','bar'],q4:['h2'],
+            bar:['b2'],rev:['b1'],echo:['b1'],call:['b2'],
+            snr:['kck','h2'],kck:['snr'],clp:['snr'],stb:['h2'],flip:['flip']};
+  var alts=swap[c.kind]||[];
+  for(i=0;i<alts.length;i++){
+    var K=KIND[alts[i]];
+    if(!K)continue;
+    alt=copyChop(c);
+    alt.kind=alts[i];alt.unit=K.unit;alt.mode=K.mode;
+    if(alt.mode==='flip')alt.count=c.count;
+    else alt.count=Math.min(c.count,2);
+    out.push(alt);
+  }
+  /* fewer throws */
+  if(c.count>1&&c.mode!=='flip'){alt=copyChop(c);alt.count=c.count-1;out.push(alt);}
+  /* --- if the repeat would start mid-sustain, do not throw the chop away:
+     resize it so the material begins on an attack instead. That is what a DJ
+     does — find the edge of the phrase, not abandon the idea. --- */
+  var bl0=localBeatLen(c.t);
+  if(c.mode!=='flip'){
+    var units=[0.25,0.5,1,2,4], bestU=null, bestArt=articulation(c.t-c.unit*bl0);
+    for(i=0;i<units.length;i++){
+      if(units[i]===c.unit)continue;
+      var a2=articulation(c.t-units[i]*bl0);
+      if(a2>bestArt+0.12){bestArt=a2;bestU=units[i];}
+    }
+    if(bestU){
+      alt=copyChop(c);
+      alt.unit=bestU;
+      alt.count=Math.min(c.count,bestU>=2?1:2);
+      out.push(alt);
+    }
+  }
+  /* let the line finish and take the next beat instead — anticipation */
+  var bl=localBeatLen(c.t);
+  alt=copyChop(c);alt.t=nearestBeatT(c.t+bl);out.push(alt);
+  alt=copyChop(c);alt.t=nearestBeatT(c.t+bl*2);out.push(alt);
+  return out;
+}
+function copyChop(c){
+  var o={};
+  for(var k in c)if(c.hasOwnProperty(k))o[k]=c[k];
+  return o;
+}
+/* would the song be better here with nothing at all? */
+function worthIt(c,placed,idx){
+  var sc=validateChop(c,idx,placed);
+  /* the bar for keeping a chop rises when the take is already busy nearby */
+  var near=0;
+  for(var i=0;i<placed.length;i++){
+    if(placed[i]===c)continue;
+    var d=Math.abs(placed[i].t-c.t);
+    if(d<barLen()*2.5)near++;      /* only genuinely adjacent company counts */
+  }
+  var bar=85+near*2;
+  return {score:sc,keep:sc>=bar,bar:bar};
+}
+function reviewLoop(){
+  var kept=[],revised=0,dropped=0,moved=0,i;
+  var order=chops.slice().sort(function(a,b){return a.t-b.t;});
+  var dur=buf?buf.duration:0;
+  var lastGap=0, prevGaps=[];
+  for(i=0;i<order.length;i++){
+    var c=order[i];
+    if(!c.auto){kept.push(c);continue;}
+
+    /* --- the story: sparse at the top, busier through the middle, pulled
+       back where the song gets quiet, and something memorable at the end --- */
+    var pos=dur?c.t/dur:0.5;
+    var arcBar=0;
+    if(pos<0.12)arcBar=4;            /* let the song introduce itself */
+    else if(pos>0.88)arcBar=-4;      /* finish on something */
+    var bar2=barIndexAt(c.t);
+    var eHere=(barEnergy&&bar2<barEnergy.length)?barEnergy[bar2]:0.5;
+    if(eHere<0.35)arcBar+=3;         /* emotional stretch — hold back */
+
+    /* --- never fall into a pattern --- */
+    if(kept.length){
+      var gap=c.t-kept[kept.length-1].t;
+      var inBars=gap/barLen();
+      var regular=0;
+      for(var g=0;g<prevGaps.length;g++)
+        if(Math.abs(prevGaps[g]-inBars)<0.35)regular++;
+      if(regular>=2)arcBar+=5;       /* this spacing is becoming a rule */
+      lastGap=inBars;
+    }
+
+    /* --- try the alternatives and keep whichever defends itself best --- */
+    var best=null,bestSc=-1,bestIsOrig=true;
+    var vars=chopVariants(c);
+    for(var v=0;v<vars.length;v++){
+      var cand=vars[v];
+      /* a variant that lands on top of something already placed is no use */
+      var clash=false;
+      for(var k2=0;k2<kept.length;k2++)
+        if(Math.abs(kept[k2].t-cand.t)<barLen()*0.55){clash=true;break;}
+      if(clash)continue;
+      var trial=kept.concat([cand]);
+      var sc=validateChop(cand,trial.length-1,trial);
+      /* the waveform's opinion of that exact moment */
+      var bmi2=beatIndexAt(cand.t);
+      var mom=(beatMoment&&bmi2<beatMoment.length)?beatMoment[bmi2]:0.5;
+      sc=sc+Math.round(mom*6-3);
+      if(sc>bestSc){bestSc=sc;best=cand;bestIsOrig=(v===0);}
+    }
+    if(!best){dropped++;continue;}
+    var verdict=worthIt(best,kept.concat([best]),kept.length);
+    if(bestSc<verdict.bar+arcBar){dropped++;continue;}
+    if(!bestIsOrig){revised++;if(Math.abs(best.t-c.t)>0.001)moved++;}
+    best.vscore=bestSc;
+    kept.push(best);
+    if(kept.length>1)prevGaps.push((best.t-kept[kept.length-2].t)/barLen());
+    if(prevGaps.length>4)prevGaps.shift();
+  }
+
+  /* --- silence is a move too: if the take never rests, make it rest --- */
+  kept.sort(function(a,b){return a.t-b.t;});
+  var biggest=0;
+  for(i=1;i<kept.length;i++)if(kept[i].t-kept[i-1].t>biggest)biggest=kept[i].t-kept[i-1].t;
+  if(biggest<15&&kept.length>6){
+    /* drop the weakest run of chops in the least eventful stretch */
+    var worstAt=-1,worstSum=1e9;
+    for(i=1;i<kept.length-2;i++){
+      var sum=(kept[i].vscore||90)+(kept[i+1].vscore||90);
+      if(sum<worstSum){worstSum=sum;worstAt=i;}
+    }
+    if(worstAt>=0){
+      kept.splice(worstAt,2);
+      dropped+=2;
+    }
+  }
+  /* --- the loop's bar rises with context, which is right for judging each
+     chop but can leave a whole take thin. So make one more pass over what it
+     turned away and take back anything that clears a flat 85 in its final
+     position, biggest gaps first. Quality stays; the mix fills out. --- */
+  kept.sort(function(a,b){return a.t-b.t;});
+  var songMin2=dur/60, perMin=songMin2?kept.length/songMin2:9;
+  var wantPerMin=4.6*(styleP?styleP.dens:1)*density;
+  var guard3=0;
+  while(perMin<wantPerMin&&guard3<14){
+    guard3++;
+    /* the widest gap that still has an unused candidate in it */
+    var bestPick=null,bestSc2=-1,bestIdx=-1;
+    for(i=0;i<order.length;i++){
+      var cd2=order[i];
+      if(!cd2.auto||kept.indexOf(cd2)>=0)continue;
+      /* where would it sit */
+      var at=0;
+      while(at<kept.length&&kept[at].t<cd2.t)at++;
+      var gapL=at>0?cd2.t-kept[at-1].t:99;
+      var gapR=at<kept.length?kept[at].t-cd2.t:99;
+      if(Math.min(gapL,gapR)<barLen()*1.8)continue;
+      var trial3=kept.slice();
+      trial3.splice(at,0,cd2);
+      var sc4=validateChop(cd2,at,trial3);
+      /* weight by how much room it is filling, so gaps close first */
+      var room=Math.min(Math.min(gapL,gapR)/(barLen()*6),1);
+      var rank=sc4+room*8;
+      if(sc4>=85&&rank>bestSc2){bestSc2=rank;bestPick=cd2;bestIdx=at;}
+    }
+    if(!bestPick)break;
+    bestPick.vscore=validateChop(bestPick,bestIdx,kept);
+    kept.splice(bestIdx,0,bestPick);
+    dropped--;
+    perMin=songMin2?kept.length/songMin2:9;
+  }
+
+  /* --- a rest is a choice; a desert is neglect. If the loop opened a hole
+     much longer than a deliberate rest, put back the best thing it dropped
+     in there. --- */
+  kept.sort(function(a,b){return a.t-b.t;});
+  var guard2=0;
+  while(guard2<3){
+    guard2++;
+    var holeAt=-1,holeLen=0,hi2=0;
+    for(i=1;i<kept.length;i++){
+      var g3=kept[i].t-kept[i-1].t;
+      if(g3>holeLen){holeLen=g3;holeAt=kept[i-1].t;hi2=i;}
+    }
+    if(holeLen<=32||!order.length)break;
+    var pick=null,pickSc=-1;
+    for(i=0;i<order.length;i++){
+      var o2=order[i];
+      if(!o2.auto)continue;
+      if(kept.indexOf(o2)>=0)continue;
+      if(o2.t<holeAt+barLen()*2||o2.t>holeAt+holeLen-barLen()*2)continue;
+      var trial2=kept.slice();
+      trial2.splice(hi2,0,o2);
+      var sc3=validateChop(o2,hi2,trial2);
+      if(sc3>pickSc){pickSc=sc3;pick=o2;}
+    }
+    if(!pick||pickSc<80)break;
+    pick.vscore=pickSc;
+    kept.splice(hi2,0,pick);
+    dropped--;
+  }
+  /* --- end on something. A mix that simply stops chopping two thirds of the
+     way through does not feel finished. --- */
+  if(dur>30&&kept.length){
+    var endFrom=dur*0.78, hasEnd=false;
+    for(i=0;i<kept.length;i++)if(kept[i].t>=endFrom)hasEnd=true;
+    if(!hasEnd){
+      var endPick=null,endSc=-1,endAt=kept.length;
+      for(i=0;i<order.length;i++){
+        var oc=order[i];
+        if(!oc.auto||kept.indexOf(oc)>=0)continue;
+        if(oc.t<endFrom||oc.t>dur-1.5)continue;
+        var pos2=kept.length;
+        while(pos2>0&&kept[pos2-1].t>oc.t)pos2--;
+        var tr=kept.slice();tr.splice(pos2,0,oc);
+        var sc5=validateChop(oc,pos2,tr);
+        if(sc5>endSc){endSc=sc5;endPick=oc;endAt=pos2;}
+      }
+      if(endPick&&endSc>=80){
+        endPick.vscore=endSc;
+        kept.splice(endAt,0,endPick);
+        dropped--;
+      }
+    }
+  }
+  chops=kept;
+  lastReview={revised:revised,dropped:dropped,moved:moved,kept:kept.length};
+  return lastReview;
 }
 /* ---------------- five maps, one winner ----------------
    One pass assumes the first idea is the best idea. Instead: build five takes
@@ -3099,6 +3426,7 @@ function buildSegments(fromT){
       var f0=c.t-span;
       if(f0<=pos+0.03)continue;
       segs.push({s:pos,e:f0,rev:false,rep:false,g:1});
+      var hv=(c.t*97.13)%1;   /* stable per chop, so a mix renders the same twice */
       for(var fk=0;fk<Math.round(c.count);fk++){
         /* each doubled beat uses the real beat boundaries where they exist */
         var fb=f0+fk*lbl, fe=f0+(fk+1)*lbl;
@@ -3106,8 +3434,12 @@ function buildSegments(fromT){
         if(Math.abs(sb-fb)<lbl*0.25)fb=sb;
         if(Math.abs(se-fe)<lbl*0.25)fe=se;
         if(fe<=fb)fe=fb+lbl;
+        /* a hand on a crossfader is never identical twice: the second pass of
+           each beat comes back a touch softer or firmer. The cut points do not
+           move — only the level does, so nothing leaves the grid. */
+        var jg=1+((((fk*7+hv*13)%5)/5)-0.5)*0.06;
         segs.push({s:fb,e:fe,rev:false,rep:false,g:1});
-        segs.push({s:fb,e:fe,rev:false,rep:true,g:1});
+        segs.push({s:fb,e:fe,rev:false,rep:true,g:clamp(jg,0.9,1.1)});
       }
       pos=c.t;
       continue;
@@ -3117,10 +3449,15 @@ function buildSegments(fromT){
     if(s0<=pos)continue;
     segs.push({s:pos,e:c.t,rev:false,rep:false,g:1});
     var alt=c.t-unit-barLen()*4;   /* the same spot one phrase earlier */
+    var hv2=(c.t*97.13)%1;
     for(var k=0;k<cnt;k++){
       var g=1, ss=s0, rv=(c.mode==='rev');
       if(c.mode==='echo')g=Math.pow(0.72,k);
       if(c.mode==='call'&&k%2===1&&alt>0)ss=alt;
+      /* a hand on a fader is never identical twice — each throw a shade
+         different in level. The cut points do not move, so nothing drifts
+         off the grid; only the feel changes. */
+      g*=clamp(1+((((k*11+hv2*17)%5)/5)-0.5)*0.07,0.9,1.1);
       segs.push({s:ss,e:ss+unit,rev:rv,rep:true,g:g});
     }
     pos=c.t;
