@@ -132,6 +132,7 @@ a.dl{display:block;text-align:center;margin-top:10px;color:var(--purple);font-we
 <div class="panel hidden" id="editor">
   <div class="row" style="justify-content:space-between;">
     <div id="edTitle">CHOP</div>
+    <div id="edAxes" style="color:#7fd4c1;font-size:10px;letter-spacing:0.3px;margin-top:3px;"></div>
     <button id="edClose" class="sm">Done</button>
   </div>
   <div class="row" style="margin-top:10px;">
@@ -251,7 +252,7 @@ a.dl{display:block;text-align:center;margin-top:10px;color:var(--purple);font-we
     <button id="snapBtn" class="grow">Snap: Auto</button>
   </div>
   <div class="row" style="margin-top:10px;">
-    <button id="lyricBtn" class="grow">Import lyrics (.lrc / .srt / .txt)</button>
+    <button id="lyricBtn" class="grow">Lyrics (optional)</button>
     <input type="file" id="lyricFile" accept=".lrc,.srt,.txt,text/plain" class="hidden">
   </div>
   <div class="hint" id="chopCount">0 chops placed</div>
@@ -430,7 +431,9 @@ function handleFile(f){
   rd.onload=function(){
     setStatus('Decoding audio...'); prog(0.2);
     getCtx().decodeAudioData(rd.result,function(b){
-      buf=b; revBuf=makeReversed(b);
+      buf=b; revBuf=null;   /* built on demand — a reversed copy of the song is
+                                another full buffer in memory and most mixes
+                                never play one */
       stretchCache={rate:0,buf:null,rev:null};
       chops=[];undoStack=[];tagMarks=[];startPos=0;selIdx=-1;
       $('editor').classList.add('hidden');
@@ -482,10 +485,24 @@ function normalize(arr){
 
 /* ---------------- analysis pipeline ---------------- */
 function analyzeAll(){
-  var sr=buf.sampleRate, n=buf.length, ch=buf.numberOfChannels;
+  var srcSr=buf.sampleRate, srcN=buf.length, ch=buf.numberOfChannels;
   var L=buf.getChannelData(0), R=ch>1?buf.getChannelData(1):L;
+  /* Analysis runs at half rate. Nothing here needs more: the highest band we
+     look at is the 7.5k hats, and Nyquist at 22k still covers it. A four
+     minute song holds nine of these arrays at once during analysis, so
+     halving the rate is the difference between fitting in memory on a phone
+     and being killed mid-load. Playback still uses the untouched buffer. */
+  var songMin=srcN/srcSr/60;
+  var dec=(srcSr>=32000)?(songMin>6?3:2):1;
+  var sr=srcSr/dec, n=Math.floor(srcN/dec);
   var mono=new Float32Array(n), side=new Float32Array(n);
-  for(var i=0;i<n;i++){mono[i]=(L[i]+R[i])*0.5;side[i]=(L[i]-R[i])*0.5;}
+  for(var i=0;i<n;i++){
+    var j=i*dec;
+    /* average the pair so decimation does not alias the top end in */
+    var l=(L[j]+(dec>1&&j+1<srcN?L[j+1]:L[j]))*0.5;
+    var r=(R[j]+(dec>1&&j+1<srcN?R[j+1]:R[j]))*0.5;
+    mono[i]=(l+r)*0.5; side[i]=(l-r)*0.5;
+  }
 
   /* 1. onset flux */
   var win=1024,hop=fluxHop;
@@ -508,7 +525,75 @@ function analyzeAll(){
     var w=acc/(nF-lag);
     if(w>bestV){bestV=w;bestLag=lag;}
   }
-  bpm=Math.round(fr*60/bestLag);
+  /* ---- tempo decision ----
+     The autocorrelation argmax is not trustworthy on its own: it peaks just as
+     happily at half, double, or a syncopation of the real tempo. So keep the
+     strongest candidates and put a musical question to each — does every beat
+     of that grid actually carry a hit, and are those hits as strong as the
+     alternative's? The grid that answers best wins, not the tallest peak. */
+  var flat=0,fcnt=0;
+  for(f=0;f<nF;f++){flat+=onsetFlux[f];fcnt++;}
+  var fluxMean=fcnt?flat/fcnt:0;
+  var hitThr=fluxMean*1.15;
+  function gridMeasure(lag){
+    if(lag<3||lag>nF/4)return null;
+    var bestP=0,bestV=-1,ph,x,c,v,idx;
+    for(ph=0;ph<8;ph++){
+      v=0;c=0;
+      for(x=lag*ph/8;x<nF;x+=lag){idx=Math.round(x);if(idx<nF){v+=onsetFlux[idx];c++;}}
+      if(c&&v/c>bestV){bestV=v/c;bestP=lag*ph/8;}
+    }
+    var hit=0,cnt=0,sum=0;
+    for(var t=bestP;t<nF;t+=lag){
+      var i2=Math.round(t);
+      if(i2>=nF)break;
+      var loc=0;
+      for(var w=-1;w<=1;w++)if(i2+w>=0&&i2+w<nF&&onsetFlux[i2+w]>loc)loc=onsetFlux[i2+w];
+      sum+=loc;cnt++;
+      if(loc>hitThr)hit++;
+    }
+    if(cnt<4)return null;
+    return {lag:lag,bpm:Math.round(fr*60/lag),fill:hit/cnt,mean:sum/cnt};
+  }
+  /* strongest autocorrelation peaks, plus the octaves of each */
+  var ranked=[];
+  for(var lg=minLag;lg<=maxLag;lg++){
+    var acc2=0;
+    for(f=0;f<nF-lg;f++)acc2+=onsetFlux[f]*onsetFlux[f+lg];
+    ranked.push({lag:lg,v:acc2/(nF-lg)});
+  }
+  ranked.sort(function(p,q){return q.v-p.v;});
+  var seen={}, pool=[];
+  for(var r=0;r<ranked.length&&pool.length<10;r++){
+    var lg2=ranked[r].lag;
+    if(seen[lg2])continue;
+    /* skip near-duplicates of something already kept */
+    var dup=false;
+    for(var pz=0;pz<pool.length;pz++)if(Math.abs(pool[pz]-lg2)<=1)dup=true;
+    if(dup)continue;
+    seen[lg2]=1;pool.push(lg2);
+  }
+  var extra=[];
+  for(var pi2=0;pi2<pool.length;pi2++){
+    extra.push(Math.round(pool[pi2]*2));
+    extra.push(Math.round(pool[pi2]/2));
+  }
+  for(var ei=0;ei<extra.length;ei++)
+    if(extra[ei]>=minLag&&extra[ei]<=maxLag&&pool.indexOf(extra[ei])<0)pool.push(extra[ei]);
+
+  var bestPick=null,bestScore=-1;
+  for(var qi=0;qi<pool.length;qi++){
+    var gm=gridMeasure(pool[qi]);
+    if(!gm)continue;
+    /* a grid is credible when its beats are occupied AND strong */
+    var sc2=gm.mean*(0.25+gm.fill*0.75);
+    if(gm.fill<0.55)sc2*=0.4;
+    /* mild preference for the tempo range screw material actually lives in */
+    var bp=gm.bpm;
+    if(bp<75||bp>150)sc2*=0.9;
+    if(sc2>bestScore){bestScore=sc2;bestPick=gm;}
+  }
+  bpm=bestPick?bestPick.bpm:Math.round(fr*60/bestLag);
   while(bpm>160)bpm=Math.round(bpm/2);
   while(bpm<70)bpm=bpm*2;
 
@@ -611,6 +696,7 @@ function analyzeAll(){
     for(var fk=fa;fk<fb&&fk<nF;fk++)os+=onsetFlux[fk];
     barOnset[bi]=os;
   }
+  bBand=null;   /* summarised — the samples are dead weight now */
   barEnergy=normalize(barEnergy); barVocal=normalize(barVocal);
   barBass=normalize(barBass);     barOnset=normalize(barOnset);
   prog(0.68);
@@ -618,9 +704,13 @@ function analyzeAll(){
   /* 5b. vocal phrases, syllables, repeated ad-libs */
   setStatus('Tracking vocal phrases...');
   anMono=mono;anVBand=vBand;anSBand=sBand;anSr=sr;
+  side=null;   /* only the two vocal bands needed it */
+  setStatus('Listening for breaths and phrase ends...');
+  try{detectBreaths(mono,sr);}catch(e){breaths=[];}
   analyzeVocalPhrases(mono,vBand,sBand,sr);
   detectInstrumental();
-  var hatBand=biquad(mono,'hp',7500,0.7,sr);
+  var hatHz=Math.min(7500,sr*0.42);   /* stay below Nyquist when decimated hard */
+  var hatBand=biquad(mono,hatHz>0?'hp':'hp',hatHz,0.7,sr);
   var subBand=biquad(mono,'lp',65,0.7,sr);
   var midBand=biquad(mono,'bp',600,0.9,sr);
   barHat=new Float32Array(nb); barMid=new Float32Array(nb);
@@ -712,8 +802,13 @@ function analyzeAll(){
     }
     barDrum.push(dg); barBassSeq.push(bs);
   }
-  anHat=hatBand;anSub=subBand;
+  detectFireLines();   /* drum lanes exist now, so the snare lock can be read */
   classifySong(mono,sr,hatBand,subBand);
+  /* every band has now been reduced to per-bar and per-beat summaries, so the
+     sample data goes. Only the mono mix is kept, and a re-analysis rebuilds
+     whatever it needs from that. */
+  anHat=null;anSub=null;anVBand=null;anSBand=null;
+  snBand=null;midBand=null;hatBand=null;subBand=null;vBand=null;sBand=null;
   if(lyricLines.length)applyLyrics();
   prog(0.74);
 
@@ -735,7 +830,9 @@ function analyzeAll(){
   $('pMain').classList.remove('hidden');
   $('drop').style.padding='16px';
   applyVibe(vibe,true);
-  autoChop();
+  setStatus('Building five different mixes...');
+  runTournament();
+  renderMixScore();updateChopCount();drawWave();writeReport([]);
   trackTypeLabel();
   prog(-1);
   setStatus('Mix ready. Hit play.');
@@ -1150,6 +1247,65 @@ function deriveSpeed(){
    each phrase, and match short phrases against each other to catch repeated
    ad-libs. That yields phrase boundaries, delivery speed and catchphrases
    without knowing the words. Actual words come from an imported .lrc/.srt/.txt. */
+/* ---- breaths ----
+   A rapper takes a breath in the gap before the next line. It reads as a short
+   burst of quiet high-frequency noise with no pitch under it. Finding them
+   marks where a line genuinely ended, which is the safest place to cut. */
+var breaths=[];
+function detectBreaths(mono,sr){
+  breaths=[];
+  var hop=512, nF=Math.floor(mono.length/hop)-2;
+  if(nF<10||nF>400000)return;
+  /* Band energies are computed while walking the samples, so nothing bigger
+     than the frame arrays is ever allocated. Materialising two more filtered
+     copies of a four-minute song is tens of megabytes and iOS will not give
+     it to us on top of the bands already held. */
+  var hE=new Float32Array(nF), lE=new Float32Array(nF);
+  var aLP=Math.exp(-2*Math.PI*700/sr);
+  var aHP=Math.exp(-2*Math.PI*2600/sr);
+  var lpS=0, hpS=0, f, i;
+  for(f=0;f<nF;f++){
+    var a=f*hop, b=a+hop, sl=0, sh=0;
+    for(i=a;i<b;i++){
+      var x=mono[i]||0;
+      lpS=lpS*aLP+x*(1-aLP);        /* what is underneath */
+      var res=x-lpS;                /* everything above it */
+      hpS=hpS*aHP+res*(1-aHP);
+      var hi=res-hpS;               /* the airy top end */
+      sl+=lpS*lpS; sh+=hi*hi;
+    }
+    lE[f]=Math.sqrt(sl/hop); hE[f]=Math.sqrt(sh/hop);
+  }
+  hE=normalize(hE); lE=normalize(lE);
+  var run=-1;
+  for(i=1;i<nF;i++){
+    /* what marks a breath is the RATIO, not the level: audible high band with
+       almost nothing underneath it. Voice has both; silence has neither. */
+    var isB=(hE[i]>0.05&&lE[i]<0.16&&hE[i]>lE[i]*3);
+    if(isB){ if(run<0)run=i; }
+    else if(run>=0){
+      var dur=(i-run)*hop/sr;
+      var mid=(run+i)/2*hop/sr;
+      /* a hi-hat is also high-band and quiet underneath — but it is short and
+         it sits on the grid. A breath is longer and lands between the beats. */
+      var onGrid=false;
+      if(beats&&beats.length){
+        var nb2=nearestBeatT(mid);
+        if(Math.abs(nb2-mid)<0.06)onGrid=true;
+      }
+      if(dur>=0.08&&dur<=0.55&&!(onGrid&&dur<0.16))
+        breaths.push({a:run*hop/sr,b:i*hop/sr,mid:mid});
+      run=-1;
+    }
+  }
+  if(breaths.length>4000)breaths=breaths.slice(0,4000);
+}
+function breathNear(t,win){
+  for(var i=0;i<breaths.length;i++){
+    if(Math.abs(breaths[i].mid-t)<=win)return 1-Math.abs(breaths[i].mid-t)/win;
+  }
+  return 0;
+}
 function analyzeVocalPhrases(mono,vBand,sBand,sr){
   var hop=512, nF=Math.floor(mono.length/hop)-2;
   phrases=[]; phrasesAll=[]; vocOnsets=[];
@@ -1216,7 +1372,8 @@ function analyzeVocalPhrases(mono,vBand,sBand,sr){
   phrases=phrasesAll;
   detectRepeatedPhrases();
   scorePhrases();
-  detectFireLines();
+  /* fire lines are scored later: they need the drum lanes, which do not exist
+     until the band analysis has run */
 }
 /* short phrases that recur are catchphrases / ad-libs — find them by shape */
 function detectRepeatedPhrases(){
@@ -1238,6 +1395,29 @@ function detectRepeatedPhrases(){
     for(k=0;k<12;k++)v[k]/=n;
     feats[pi]=v; return v;
   }
+  /* melodic contour: where the voice sits in pitch across the phrase. Two
+     lines sung on the same tune match here even when the words differ, which
+     is how a hook line is recognised with no transcript. */
+  var mels={};
+  function melody(pi){
+    if(mels[pi])return mels[pi];
+    var p=phrases[pi], m=new Float32Array(8), k;
+    if(!anMono){mels[pi]=m;return m;}
+    for(k=0;k<8;k++){
+      var t0=p.a+(p.dur*k/8);
+      var c0=Math.floor(t0*anSr), win=2048;
+      if(c0+win>=anMono.length){m[k]=0;continue;}
+      /* strongest pitch class in this slice of the vocal band */
+      var best=0,bv=-1;
+      for(var pc=0;pc<12;pc++){
+        var g=goertzel(anMono,c0,win,220*Math.pow(2,pc/12),anSr)
+             +goertzel(anMono,c0,win,440*Math.pow(2,pc/12),anSr);
+        if(g>bv){bv=g;best=pc;}
+      }
+      m[k]=best/12;
+    }
+    mels[pi]=m; return m;
+  }
   for(var x=0;x<shorts.length;x++){
     for(var y=x+1;y<shorts.length;y++){
       var A=phrases[shorts[x]], B=phrases[shorts[y]];
@@ -1245,7 +1425,13 @@ function detectRepeatedPhrases(){
       if(Math.abs(A.syl-B.syl)>1)continue;
       var fa=feat(shorts[x]), fb=feat(shorts[y]), dot=0;
       for(var k2=0;k2<12;k2++)dot+=fa[k2]*fb[k2];
-      if(dot>0.88){A.rep++;B.rep++;}
+      if(dot>0.88){A.rep++;B.rep++;continue;}
+      /* same tune, different loudness shape — still a repeat */
+      if(dot>0.62){
+        var ma=melody(shorts[x]), mb=melody(shorts[y]), same=0;
+        for(var k3=0;k3<8;k3++)if(Math.abs(ma[k3]-mb[k3])<0.09)same++;
+        if(same>=6){A.rep++;B.rep++;A.melRep=1;B.melRep=1;}
+      }
     }
   }
 }
@@ -1295,9 +1481,17 @@ function detectFireLines(){
       for(var h=0;h<HYPE.length;h++)if(tl.indexOf(HYPE[h])>=0){lyr=Math.max(lyr,0.75);break;}
       if(p.words&&p.words<=5)lyr=Math.max(lyr,0.5);       /* the one-liner */
     }
+    /* a breath right after the line is the rapper confirming it landed */
+    var br=breathNear(p.b+0.18,0.45);
+    p.breath=br;
+    /* punchline, heard rather than read: short, delivered hard, and followed
+       by air — no word list required */
+    p.punch=(p.gapAfter>0.55&&p.dur<=2.2&&(punchE>0.35||br>0.3));
     p.fire=clamp(punchE*0.30+closer*0.22+space*0.20+flurry*0.10+lyr*0.18+(p.punch?0.12:0),0,1);
     /* ---- snare lock: the last word before a snare, or the first word after
-       one, is where a chop feels natural without breaking the flow ---- */
+       one, is where a chop feels natural without breaking the flow.
+       Skipped when the drum lanes have not been built yet. ---- */
+    if(!beatSnare||!beats.length){p.snarePre=0;p.snarePost=0;continue;}
     var preI=beatIndexAt(p.b), postI=beatIndexAt(p.a);
     var snPre=0, snPost=0, k;
     for(k=preI;k<=preI+1&&k<beats.length;k++){
@@ -1338,6 +1532,8 @@ function scorePhrases(){
     if(p.rate>7&&p.rep<1)pen+=0.30;           /* fast multisyllable that never loops */
     if(p.adlib)shortB=Math.max(shortB,0.85);
     if(p.punch)repB=Math.max(repB,0.70);
+    if(p.melRep)repB=Math.max(repB,0.75);      /* same tune came back */
+    iso=Math.max(iso,(p.breath||0)*0.8);       /* a breath after it is real space */
     p.score=clamp(shortB*0.32+onBeat*0.24+repB*0.20+iso*0.14+clamp(p.energy*3,0,1)*0.10-pen,0,1);
   }
 }
@@ -1349,7 +1545,12 @@ function voicedAt(t){
   return -1;
 }
 /* would cutting here slice a word in half? */
+function breathBoundary(t){
+  /* a breath is silence with intent — cutting on one never clips a word */
+  return breathNear(t,0.20)>0;
+}
 function cutOk(t){
+  if(breathBoundary(t))return true;
   if(!phrases.length)return true;
   var pi=voicedAt(t);
   if(pi<0)return true;                       /* nothing being sung — always fine */
@@ -1391,7 +1592,7 @@ function normWord(w){return w.toLowerCase().replace(/[^a-z' ]/g,'').replace(/\s+
 function applyLyrics(){
   if(!phrases.length||!lyricLines.length)return;
   var timed=lyricLines[0].t>=0, i, j;
-  for(i=0;i<phrases.length;i++){phrases[i].text='';phrases[i].words=0;phrases[i].adlib=false;phrases[i].punch=false;phrases[i].rhyme=0;}
+  for(i=0;i<phrases.length;i++){phrases[i].text='';phrases[i].words=0;phrases[i].adlib=false;phrases[i].rhyme=0;}  /* punch stays: the audio decided it */
   if(timed){
     for(i=0;i<lyricLines.length;i++){
       var best=-1,bd=9;
@@ -1445,7 +1646,7 @@ function applyLyrics(){
     var t3=normWord(phrases[i].text);
     if(t3&&freq[t3]>1)phrases[i].rep=Math.max(phrases[i].rep,freq[t3]-1);
     /* punchline: the line that lands right before a real break */
-    if(phrases[i].gapAfter>0.7&&phrases[i].words&&phrases[i].words<=9)phrases[i].punch=true;
+    if(phrases[i].gapAfter>0.7&&phrases[i].words&&phrases[i].words<=9)phrases[i].punch=true;  /* lyrics only ever add to what the audio already found */
   }
   scorePhrases();
 }
@@ -1730,21 +1931,25 @@ function updateChopCount(){
   into a hook, and there's a real transient to land on. Only high-confidence
   spots get used — everything else is left alone on purpose.
 */
-function reanalyze(){
+function reanalyze(skipChop){
   /* everything downstream of the decoded audio is rebuilt from scratch */
   if(!anMono){autoChop();return;}
-  analyzeVocalPhrases(anMono,anVBand,anSBand,anSr);
+  try{detectBreaths(anMono,anSr);}catch(e){breaths=[];}
+  /* rebuilt here rather than held for the life of the session */
+  var rv=biquad(anMono,'bp',1300,0.8,anSr);
+  analyzeVocalPhrases(anMono,rv,rv,anSr);
+  rv=null;
   detectInstrumental();
   if(lyricLines.length)applyLyrics();
   detectFireLines();
   buildSections();
-  if(anHat&&anSub)classifySong(anMono,anSr,anHat,anSub);
   deriveSpeed();
+  if(skipChop)return;
   autoChop();
   drawWave();
   updateChopCount();
 }
-function autoChop(){
+function autoChop(quiet){
   styleP=styleParams();
   var SP=styleP;
   pushUndo();
@@ -1800,7 +2005,7 @@ function autoChop(){
     var relB=bIdx-sc2.a;
     var phW=(relB%4===0)?0.8:((relB%2===0)?0.45:0.25);
     var raw2=(phW*0.7+ph.score*2.4+clamp(E[bIdx],0,1)*0.3+(ph.adlib?0.5:0)+(ph.rep>0?0.35:0)
-             +ph.fire*1.5+ph.rhyme*0.35+ph.snarePre*0.9)*secW2;
+             +ph.fire*1.5+ph.rhyme*0.35+ph.snarePre*0.9+(ph.breath||0)*0.8)*secW2;
     var bI2=beatIndexAt(te);
     var drum2=beatSnare[bI2]*1.0+beatKick[bI2]*0.6+(Math.abs(te-barStarts[bIdx])<beatLen()*0.5?0.25:0);
     cands.push({t:te,bar:bIdx,raw:raw2+clamp(drum2,0,1.6)*0.5,rise:E[bIdx]-E[Math.max(0,bIdx-1)],
@@ -2400,6 +2605,8 @@ function autoChop(){
   }
   lastTally=tally; lastRest=restedSection;
   critiqueChops();
+  if(quiet)return;
+  validateChops();
   scoreMix();
   renderMixScore();
   updateChopCount();
@@ -2468,6 +2675,13 @@ function writeReport(picked){
   if(stC)line(stC+' chop'+(stC>1?'s':'')+' grab a piano or synth stab — the hit itself gets caught and thrown back.');
   if(drC)line(drC+' land right on a bass drop.');
   line('The take is shaped like a set: calm stretches stay calm, the bars running into a hook build, and the bar after one breathes. Chop weight follows that arc instead of sitting flat across the song.');
+  if(lastTourney.length){
+    var tl=[];
+    for(i=0;i<lastTourney.length;i++)tl.push(lastTourney[i].label+' '+lastTourney[i].score);
+    line('Built five mixes and kept the best one: '+tl.join(', ')+'. Winner: '+lastWinner+'. Remix to run the five again with new decisions.');
+  }
+  if(lastValid.removed||lastValid.repaired)line('Validation pass scored every chop out of 100 on groove, timing, phrasing, drum alignment, impact and naturalness — including whether the splice would click. '+(lastValid.repaired?lastValid.repaired+' were repaired (re-snapped, shortened, or fewer repeats)':'')+(lastValid.repaired&&lastValid.removed?' and ':'')+(lastValid.removed?lastValid.removed+' could not reach 85 and were removed':'')+'.');
+  else if(chops.length)line('Every chop cleared the 85 mark on all six axes first time.');
   if(lastCrit.removed||lastCrit.adjusted)line('Second pass reviewed every chop like a DJ listening back: '+(lastCrit.removed?lastCrit.removed+' cut for crowding or dirty edges':'')+(lastCrit.removed&&lastCrit.adjusted?', ':'')+(lastCrit.adjusted?lastCrit.adjusted+' adjusted (re-snapped, shortened, or varied)':'')+'. Only what survived review made the mix.');
   else line('Second pass reviewed every chop and found nothing to fix.');
   if(flC)line(flC+' turntable flips — the DJ Screw staple: same record on two decks a beat apart, crossfader flipping, every beat through the bar hits twice. Each flip only lands where every internal cut clears the vocal.');
@@ -2491,7 +2705,7 @@ function writeReport(picked){
   if(adl)line(adl+' chop'+(adl>1?'s':'')+' caught an ad-lib from your lyric file.');
   if(!isInst)line('Anything that would have cut mid-word was thrown out — the repeat has to start and end on a syllable boundary or a silence.');
   else line('Chops here grab the beat itself — bar loops, two-beat catches, reverses on the drums — since there are no words to protect.');
-  if(!lyricLines.length&&!isInst)line('No lyric file loaded, so the fire lines were picked by delivery — how hard a line is said versus its neighbours, where it sits in the four-bar group, and the space after it. Import an .lrc or .srt and rhyme endings and hype words sharpen that read.');
+  if(!lyricLines.length&&!isInst)line('Working from the audio alone: beat grid, kick/snare/clap transients, where each vocal phrase starts and ends, the breaths between them, energy changes, repeated melodies and the chorus. No lyrics needed — an .lrc only sharpens rhyme endings if you have one.');
   if(vocN&&!isInst)line(vocN+' chop'+(vocN>1?'s land':' lands')+' on the tail of a vocal line, so the last words hit twice instead of cutting someone off mid-word.');
   if(hookN)line(hookN+' sit inside hooks — that\'s where repeats carry.');
   if(instN)line(instN+' grab an instrumental hit instead of a vocal: a stab, a riff, a bass entrance.');
@@ -2514,8 +2728,127 @@ function writeReport(picked){
    four DJ instincts: is it dead on the beat, does it cut clean, is it crowding
    the chop before it, is the take getting monotonous. Anything that fails gets
    fixed if it can be and cut if it can't. */
+/* ---------------- validation pass ----------------
+   Before anything is rendered, every chop is examined on its own terms and
+   scored out of 100 across six axes. A chop that cannot defend itself is
+   repaired if possible and dropped if not. Quality, not quantity. */
+function seamLevel(t){
+  /* how loud the record is right at a cut — a splice through a loud sustained
+     moment is where clicks and thumps come from */
+  if(!anMono||!anSr)return 0;
+  var c=Math.floor(t*anSr), w=Math.floor(anSr*0.004);
+  if(c-w<0||c+w>=anMono.length)return 0;
+  var pre=0,post=0,i;
+  for(i=c-w;i<c;i++)pre+=anMono[i]*anMono[i];
+  for(i=c;i<c+w;i++)post+=anMono[i]*anMono[i];
+  return {pre:Math.sqrt(pre/w),post:Math.sqrt(post/w)};
+}
+function seamRisk(c){
+  /* the two joins a repeat makes: into the repeat, and back out of it */
+  var u=(c.mode==='flip'?1:c.unit)*localBeatLen(c.t);
+  var inA=seamLevel(c.t-u), outA=seamLevel(c.t);
+  if(!inA||!outA)return 0;
+  /* a jump from loud to quiet (or back) across a splice is what pops */
+  var d1=Math.abs(inA.pre-outA.pre), d2=Math.abs(outA.pre-outA.post);
+  var lvl=Math.max(inA.pre,outA.pre,0.001);
+  return clamp(Math.max(d1,d2)/lvl,0,1);
+}
+function validateChop(c,idx,sorted){
+  var ax={},bl=localBeatLen(c.t);
+  /* --- timing: dead on the grid or not --- */
+  var off=Math.abs(c.t-nearestBeatT(c.t));
+  ax.timing=clamp(1-off/(bl*0.06),0,1);
+  /* --- drum alignment: does it answer a hit --- */
+  var bi=beatIndexAt(c.t);
+  var acc=0;
+  if(beatSnare&&bi<beatSnare.length)
+    acc=Math.max(beatSnare[bi]||0,(beatKick[bi]||0)*0.85,(beatSnare[Math.max(0,bi-1)]||0)*0.8);
+  var onBar=(barStarts.length&&Math.abs(c.t-nearestBar(c.t))<bl*0.12)?0.35:0;
+  ax.drum=clamp(acc*0.8+onBar+0.15,0,1);
+  /* --- vocal phrasing: never through a word --- */
+  var uEnd=c.t, uStart=c.t-(c.mode==='flip'?c.count:c.unit)*bl;
+  var clean=(cutOk(uEnd)?0.5:0)+(cutOk(uStart)?0.5:0);
+  if(c.cat==='beat')clean=Math.max(clean,0.8);       /* drums have no syllables */
+  var br=Math.max(breathNear(uStart,0.25),breathNear(uEnd,0.25));
+  ax.phrasing=clamp(clean+br*0.25,0,1);
+  /* --- groove: room to breathe on both sides --- */
+  var gapPrev=idx>0?(c.t-sorted[idx-1].t):99;
+  var gapNext=idx<sorted.length-1?(sorted[idx+1].t-c.t):99;
+  var ext=(c.mode==='flip'?c.count:c.unit*c.count)*bl;
+  var tight=Math.min(gapPrev,gapNext);
+  ax.groove=clamp((tight-ext)/(barLen()*1.2),0,1);
+  if(tight>barLen()*16)ax.groove*=0.85;              /* stranded on its own */
+  /* --- musical impact: is this a moment worth repeating --- */
+  var bar=barIndexAt(c.t);
+  var eHere=(barEnergy&&bar<barEnergy.length)?barEnergy[bar]:0.5;
+  var rise=(barEnergy&&bar>0&&bar<barEnergy.length)?(barEnergy[bar]-barEnergy[bar-1]):0;
+  /* confidence is a percentile across the take's survivors, so it lives in
+     roughly 0.70-1.00. Mapping it as if it spanned zero to one made every
+     honest chop look mediocre. */
+  var cf2=clamp(((c.conf||0.75)-0.68)/0.32,0,1);
+  /* the axes are scaled so a competent chop reads about 0.85 and only a
+     genuinely weak one falls below. Confidence is a percentile, so on its own
+     it can never average high — it informs the score, it does not define it. */
+  ax.impact=clamp(0.55+cf2*0.25+clamp(eHere,0,1)*0.10+clamp(rise*2.5,0,1)*0.10+(c.fire||0)*0.15,0,1);
+  /* --- naturalness: no clicks, sane repeat count, musical material length --- */
+  var risk=seamRisk(c);
+  /* one or two throws is the house style; three is a choice; four is a stunt.
+     How much it costs depends on what is being thrown: four hits of a quarter
+     beat stab is a stutter, four hits of a two beat phrase is a mess. */
+  var matLen=c.unit||1;
+  var cntPenalty=0;
+  if(c.mode!=='flip'&&c.count>=3){
+    var over=c.count-2;
+    cntPenalty=over*(0.09+matLen*0.16);
+  }
+  var unitOk=(c.mode==='flip')||[0.25,0.5,1,2,4].indexOf(c.unit)>=0;
+  /* a splice always moves the level a little — only a real jump is a click */
+  ax.natural=clamp((unitOk?1:0.5)-clamp(risk-0.35,0,1)*0.75-cntPenalty,0,1);
+  var mean=(ax.timing*0.20+ax.drum*0.18+ax.phrasing*0.22+
+            ax.groove*0.14+ax.impact*0.14+ax.natural*0.12)*100;
+  /* A weighted average lets a chop coast: brilliant on five counts and
+     unacceptable on the sixth still passes. But a chop that clicks, or that
+     crowds the one before it, is a bad chop no matter what else it does well.
+     So the weakest axis caps the total. */
+  var worst=Math.min(ax.timing,ax.drum,ax.phrasing,ax.groove,ax.impact,ax.natural);
+  var cap=60+worst*40;
+  var total=Math.round(Math.min(mean,cap));
+  c.axes=ax; c.vscore=total;
+  return total;
+}
+function validateChops(){
+  var removed=0,repaired=0,i;
+  chops.sort(function(a,b){return a.t-b.t;});
+  for(i=chops.length-1;i>=0;i--){
+    var c=chops[i];
+    if(!c.auto)continue;                       /* your own chops are yours */
+    var sc=validateChop(c,i,chops);
+    if(sc>=85)continue;
+    /* --- try to repair before giving up on it --- */
+    var before=sc;
+    c.t=nearestBeatT(c.t);                     /* back onto the grid */
+    if(c.mode!=='flip'){
+      /* too many repeats is the commonest fault, and the cheapest to fix */
+      while(c.count>1&&validateChop(c,i,chops)<85)c.count--;
+      /* a dirty edge often cleans up at half the length */
+      var guard=0;
+      while(validateChop(c,i,chops)<85&&c.unit>0.25&&guard<2){c.unit=c.unit/2;guard++;}
+    }else{
+      while(c.count>2&&validateChop(c,i,chops)<85)c.count-=2;
+    }
+    sc=validateChop(c,i,chops);
+    if(sc>=85){repaired++;continue;}
+    chops.splice(i,1);removed++;
+  }
+  /* one more pass so the scores reflect the final neighbours */
+  chops.sort(function(a,b){return a.t-b.t;});
+  for(i=0;i<chops.length;i++)validateChop(chops[i],i,chops);
+  lastValid={removed:removed,repaired:repaired};
+  return lastValid;
+}
 /* ---- mix score: what the critic thinks of the finished take ---- */
 var mixScore={total:0,notes:[],weak:[]};
+var lastValid={removed:0,repaired:0}, lastWinner='';
 function scoreMix(){
   var i,n=chops.length;
   if(!n){mixScore={total:0,notes:[],weak:[]};return;}
@@ -2622,6 +2955,62 @@ function optimizeMix(){
   scoreMix();
   updateChopCount();drawWave();renderMixScore();
   setStatus('Optimized: '+fixed+' chop'+(fixed===1?'':'s')+' fixed or removed ('+before+' \u2192 '+chops.length+'), mix now '+mixScore.total+'/100.');
+}
+/* ---------------- five maps, one winner ----------------
+   One pass assumes the first idea is the best idea. Instead: build five takes
+   with genuinely different instincts, score each on the finished result, and
+   keep the one that actually came out best. */
+var TOURNEY=[
+  {style:'vocal',  label:'Vocal heavy'},
+  {style:'drums',  label:'Drum heavy'},
+  {style:'barend', label:'Punchline focused'},
+  {style:'classic',label:'Classic Houston'},
+  {style:'free',   label:'Freestyle AI'}
+];
+var lastTourney=[];
+function snapshotChops(){
+  var out=[];
+  for(var i=0;i<chops.length;i++){
+    var c=chops[i],o={};
+    for(var k in c)if(c.hasOwnProperty(k))o[k]=c[k];
+    out.push(o);
+  }
+  return out;
+}
+function runTournament(){
+  if(!buf)return;
+  var manual=[];
+  for(var m=0;m<chops.length;m++)if(!chops[m].auto)manual.push(chops[m]);
+  var savedStyle=chopStyle, savedSeed=seed;
+  var best=null,results=[];
+  for(var i=0;i<TOURNEY.length;i++){
+    chopStyle=TOURNEY[i].style;
+    seed=savedSeed+i*7919;
+    autoChop(true);                 /* quiet: no report, no redraw */
+    validateChops();
+    scoreMix();
+    /* the take's own quality, plus how well each chop defended itself */
+    var vAvg=0;
+    for(var q=0;q<chops.length;q++)vAvg+=(chops[q].vscore||0)/Math.max(1,chops.length);
+    var combined=Math.round(mixScore.total*0.6+vAvg*0.4);
+    results.push({label:TOURNEY[i].label,style:TOURNEY[i].style,score:combined,
+                  mix:mixScore.total,valid:Math.round(vAvg),n:chops.length});
+    if(!best||combined>best.score){
+      best={label:TOURNEY[i].label,style:TOURNEY[i].style,score:combined,
+            seed:seed,chops:snapshotChops(),notes:mixScore.notes.slice(),total:mixScore.total};
+    }
+  }
+  /* reinstate the winner */
+  chopStyle=best.style; seed=best.seed;
+  chops=best.chops;
+  for(var mm=0;mm<manual.length;mm++)chops.push(manual[mm]);
+  chops.sort(function(a,b){return a.t-b.t;});
+  validateChops();
+  scoreMix();
+  lastTourney=results;
+  lastWinner=best.label;
+  chopStyle=savedStyle;
+  return best;
 }
 function critiqueChops(){
   var removed=0, adjusted=0, i;
@@ -2755,7 +3144,7 @@ function ensureStretched(){
   if(stretchCache.rate===speed&&stretchCache.buf)return;
   setStatus('Building pitch-preserved version...');
   var sb=stretchBuffer(buf,1/speed);
-  stretchCache={rate:speed,buf:sb,rev:makeReversed(sb)};
+  stretchCache={rate:speed,buf:sb,rev:null};   /* reversed copy built only if a reverse chop plays */
   setStatus('');
 }
 function stretchBuffer(src,factor){
@@ -2843,6 +3232,13 @@ function makeChain(ctx){
 function scheduleAll(ctx,chain,fromT,when,stopAt){
   var segs=buildSegments(fromT);
   var pp=preservePitch&&stretchCache.buf;
+  /* only pay for the reversed buffer if this take actually reverses something */
+  var needRev=false;
+  for(var rq=0;rq<segs.length;rq++)if(segs[rq].rev){needRev=true;break;}
+  if(needRev){
+    if(pp&&!stretchCache.rev)stretchCache.rev=makeReversed(stretchCache.buf);
+    if(!pp&&!revBuf)revBuf=makeReversed(buf);
+  }
   var pBuf=pp?stretchCache.buf:buf, pRev=pp?stretchCache.rev:revBuf;
   var rate=pp?1.0:speed, sc=pp?1/speed:1;
   var t=when,entries=[],srcs=[];
@@ -3147,7 +3543,13 @@ function openEditor(i){
   selIdx=i;
   var c=chops[i];
   $('editor').classList.remove('hidden');
-  $('edTitle').textContent=(c.auto?'AI CHOP':'YOUR CHOP')+' — score '+Math.round((c.conf||0.5)*100)+'/100'+(KIND[c.kind]&&KIND[c.kind].cat==='beat'?' — beat chop':'');
+  $('edTitle').textContent=(c.auto?'AI CHOP':'YOUR CHOP')+' — '+(c.vscore!==undefined?c.vscore:Math.round((c.conf||0.5)*100))+'/100'+(KIND[c.kind]&&KIND[c.kind].cat==='beat'?' — beat chop':'');
+  if(c.axes&&$('edAxes')){
+    var A=c.axes;
+    $('edAxes').textContent='groove '+Math.round(A.groove*100)+' \u00b7 timing '+Math.round(A.timing*100)+
+      ' \u00b7 phrasing '+Math.round(A.phrasing*100)+' \u00b7 drums '+Math.round(A.drum*100)+
+      ' \u00b7 impact '+Math.round(A.impact*100)+' \u00b7 natural '+Math.round(A.natural*100);
+  }
   $('edType').value=c.kind;
   $('edCount').textContent=edCountLabel(c);
   $('edPos').textContent=fmtTime(c.t);
@@ -3388,8 +3790,10 @@ $('autoBtn').addEventListener('click',function(){
   var self=this;
   setTimeout(function(){
     try{
-      reanalyze();
-      setStatus('New read on the song: '+chops.length+' chops, '+STYLES[chopStyle].name+'.');
+      reanalyze(true);
+      runTournament();
+      renderMixScore();updateChopCount();drawWave();writeReport([]);
+      setStatus('Five mixes built, kept '+lastWinner+' — '+chops.length+' chops at '+mixScore.total+'/100.');
     }catch(e){
       setStatus('Re-analysis hit a problem — kept the previous mix.');
     }
