@@ -50,6 +50,13 @@ button:disabled{opacity:0.35;}
 .stat .k{font-size:9px;letter-spacing:2px;color:var(--dim);text-transform:uppercase;margin-top:5px;}
 #waveWrap{display:none;position:relative;background:#0a0610;border:1px solid var(--line);border-radius:14px;
   margin-top:12px;padding:8px;}
+.scoreTop{display:flex;align-items:baseline;gap:6px;margin-bottom:8px;}
+.scoreNum{font-family:'Archivo Black',sans-serif;font-size:30px;color:var(--purple);line-height:1;}
+.scoreOf{font-size:13px;color:#8a7fa8;}
+.scoreLbl{margin-left:auto;font-size:10px;letter-spacing:2px;color:#8a7fa8;}
+.scoreLine{font-size:12px;line-height:1.7;color:#cfc4e4;}
+.sOk{color:#7fd4c1;}
+.sWarn{color:#ffb84d;}
 #wave{width:100%;height:172px;display:block;border-radius:8px;touch-action:none;}
 #pos{position:absolute;top:12px;right:16px;font-size:11px;color:var(--cream);font-variant-numeric:tabular-nums;pointer-events:none;}
 .hint{font-size:11px;color:var(--dim);margin-top:8px;text-align:center;line-height:1.5;}
@@ -113,7 +120,8 @@ a.dl{display:block;text-align:center;margin-top:10px;color:var(--purple);font-we
 <div id="waveWrap">
   <div id="pos">0:00</div>
   <canvas id="wave"></canvas>
-  <div class="legend">
+  <div id="mixScore" class="panel hidden" style="border-color:#5b34a6;"></div>
+<div class="legend">
     <span><i style="background:#4a4266"></i>Vocal line heard</span>
     <span><i style="background:#7fd4c1"></i>Line that repeats</span>
     <span><i style="background:#ffb84d"></i>Ad-lib &middot; DJ tag</span>
@@ -213,7 +221,7 @@ a.dl{display:block;text-align:center;margin-top:10px;color:var(--purple);font-we
 <div class="panel hidden adv" id="pChops">
   <div class="plabel">Chops</div>
   <div class="row">
-    <button id="autoBtn" class="primary grow">Rebuild chops</button>
+    <button id="autoBtn" class="primary grow">Re-analyze song</button>
     <button id="undoBtn">Undo</button>
     <button id="clearBtn">Clear</button>
   </div>
@@ -236,8 +244,11 @@ a.dl{display:block;text-align:center;margin-top:10px;color:var(--purple);font-we
     <button id="addMode">+ Tap-to-chop</button>
   </div>
   <div class="row" style="margin-top:10px;">
-    <button id="densBtn" class="grow">Chop amount: Normal</button>
-    <button id="snapBtn" class="grow on">Snap: Bar</button>
+    <button id="styleBtn" class="grow">Style: Classic Screw</button>
+  </div>
+  <div class="row">
+    <button id="densBtn" class="grow">Groove: Steady</button>
+    <button id="snapBtn" class="grow">Snap: Auto</button>
   </div>
   <div class="row" style="margin-top:10px;">
     <button id="lyricBtn" class="grow">Import lyrics (.lrc / .srt / .txt)</button>
@@ -298,6 +309,8 @@ var bpm=0, beats=[], barStarts=[], keyName='--';
 var onsetFlux=null, fluxHop=512;
 var barEnergy=null, barVocal=null, barBass=null, barOnset=null, barHat=null, barMid=null;
 var gridDrift={moved:0,avg:0};
+var aiFx=true;
+var anMono=null,anVBand=null,anSBand=null,anHat=null,anSub=null,anSr=44100;
 var beatKick=null, beatSnare=null, beatHat=null, beatStab=null, barFill=null, barDrop=null, secChopCount={};
 var barChroma=null, barDrum=null, barBassSeq=null;
 var sections=[];               /* {a,b,type,energy,vocal} bar indices */
@@ -342,13 +355,44 @@ var fx={
   rev:{on:false,val:20}, crk:{on:true,val:35}, wob:{on:true,val:30}
 };
 /* vibes shift the analyzed speed rather than overriding it */
+/* ---- chop styles: a set of musical instincts, not a filter ----
+   dens   how much movement the take wants
+   voc    pull toward vocal chops (1 = neutral)
+   beat   pull toward beat/instrumental chops
+   flip   how strongly the two-deck flip is favoured
+   big    appetite for long material (bar/b2/flip spans)
+   rpt    appetite for multiple repeats
+   fire   weight on punchlines and bar-end lyrics
+   gap    minimum seconds between major vocal chops
+   arc    how hard the tension arc is shaped */
+var STYLES={
+  classic:{name:'Classic Screw',    dens:0.85,voc:1.05,beat:1.0, flip:1.15,big:0.9, rpt:0.8, fire:1.0, gap:14,arc:1.0},
+  barend: {name:'Bar End Punchlines',dens:1.0, voc:1.35,beat:0.75,flip:0.9, big:0.8, rpt:1.0, fire:1.9, gap:11,arc:0.9},
+  drums:  {name:'Drum Driven',      dens:1.15,voc:0.55,beat:1.6, flip:1.35,big:1.15,rpt:0.9, fire:0.7, gap:16,arc:1.1},
+  vocal:  {name:'Vocal Heavy',      dens:1.05,voc:1.75,beat:0.6, flip:0.75,big:0.85,rpt:1.15,fire:1.35,gap:9, arc:0.9},
+  instru: {name:'Instrumental Heavy',dens:1.1, voc:0.35,beat:1.8, flip:1.4, big:1.25,rpt:0.85,fire:0.5, gap:18,arc:1.0},
+  aggro:  {name:'Aggressive',       dens:1.55,voc:1.15,beat:1.25,flip:1.3, big:1.2, rpt:1.5, fire:1.2, gap:8, arc:1.25},
+  minimal:{name:'Minimal',          dens:0.5, voc:1.0, beat:1.0, flip:1.0, big:0.7, rpt:0.5, fire:1.25,gap:20,arc:0.8},
+  free:   {name:'Freestyle (AI)',   dens:1.0, voc:1.0, beat:1.0, flip:1.0, big:1.0, rpt:1.0, fire:1.0, gap:12,arc:1.0}
+};
+var STYLE_ORDER=['classic','barend','drums','vocal','instru','aggro','minimal','free'];
+var chopStyle='classic', styleP=null;
+/* Freestyle rolls a fresh set of instincts every render — a different DJ each time */
+function styleParams(){
+  var b=STYLES[chopStyle]||STYLES.classic;
+  if(chopStyle!=='free')return b;
+  return {name:b.name,
+    dens:0.6+rnd()*1.1, voc:0.4+rnd()*1.4, beat:0.5+rnd()*1.3, flip:0.7+rnd()*0.8,
+    big:0.7+rnd()*0.7, rpt:0.6+rnd()*1.0, fire:0.7+rnd()*1.2,
+    gap:8+rnd()*10, arc:0.8+rnd()*0.5};
+}
 var VIBES={
-  classic:{d:0, dens:1,  fx:{bass:[1,7], lp:[0,4500],echo:[1,25],rev:[0,20],crk:[1,30],wob:[1,30]}},
-  deep:   {d:-6,dens:0.8,fx:{bass:[1,12],lp:[1,5200],echo:[1,30],rev:[1,26],crk:[1,25],wob:[1,35]}},
-  chopped:{d:-2,dens:1.8,fx:{bass:[1,8], lp:[0,4500],echo:[1,32],rev:[0,20],crk:[1,35],wob:[1,30]}},
-  night:  {d:-4,dens:0.5,fx:{bass:[1,9], lp:[1,6500],echo:[1,18],rev:[1,30],crk:[0,20],wob:[1,20]}},
-  og:     {d:-9,dens:1.2,fx:{bass:[1,10],lp:[1,3800],echo:[1,34],rev:[1,22],crk:[1,60],wob:[1,55]}},
-  trap:   {d:5, dens:1.3,fx:{bass:[1,11],lp:[0,4500],echo:[1,22],rev:[0,20],crk:[0,20],wob:[1,18]}}
+  classic:{d:0, dens:1,  style:'classic',fx:{bass:[1,7], lp:[0,4500],echo:[1,25],rev:[0,20],crk:[1,30],wob:[1,30]}},
+  deep:   {d:-6,dens:0.8,style:'classic',fx:{bass:[1,12],lp:[1,5200],echo:[1,30],rev:[1,26],crk:[1,25],wob:[1,35]}},
+  chopped:{d:-2,dens:1.8,style:'drums',  fx:{bass:[1,8], lp:[0,4500],echo:[1,32],rev:[0,20],crk:[1,35],wob:[1,30]}},
+  night:  {d:-4,dens:0.5,style:'minimal',fx:{bass:[1,9], lp:[1,6500],echo:[1,18],rev:[1,30],crk:[0,20],wob:[1,20]}},
+  og:     {d:-9,dens:1.2,style:'classic',fx:{bass:[1,10],lp:[1,3800],echo:[1,34],rev:[1,22],crk:[1,60],wob:[1,55]}},
+  trap:   {d:5, dens:1.3,style:'vocal',  fx:{bass:[1,11],lp:[0,4500],echo:[1,22],rev:[0,20],crk:[0,20],wob:[1,18]}}
 };
 
 function $(id){return document.getElementById(id);}
@@ -573,6 +617,7 @@ function analyzeAll(){
 
   /* 5b. vocal phrases, syllables, repeated ad-libs */
   setStatus('Tracking vocal phrases...');
+  anMono=mono;anVBand=vBand;anSBand=sBand;anSr=sr;
   analyzeVocalPhrases(mono,vBand,sBand,sr);
   detectInstrumental();
   var hatBand=biquad(mono,'hp',7500,0.7,sr);
@@ -667,6 +712,7 @@ function analyzeAll(){
     }
     barDrum.push(dg); barBassSeq.push(bs);
   }
+  anHat=hatBand;anSub=subBand;
   classifySong(mono,sr,hatBand,subBand);
   if(lyricLines.length)applyLyrics();
   prog(0.74);
@@ -1636,7 +1682,40 @@ function nearestBeatT(t){
   }
   return best;
 }
-function snapT(t){return snapBar?nearestBar(t):nearestBeatT(t);}
+var SNAPS=['auto','beat','half','quarter','bar','phrase'];
+var SNAP_NAMES={auto:'Auto',beat:'Beat',half:'Half beat',quarter:'Quarter beat',bar:'Bar',phrase:'Phrase'};
+var snapMode='auto';
+function grooveName(){
+  return density>=1.5?'Busy':(density<=0.6?'Laid back':'Steady');
+}
+function snapGrid(t,div){
+  /* nearest subdivision of the beat, measured on the real (possibly drifting) grid */
+  var b=nearestBeatT(t), bl=localBeatLen(t), step=bl/div;
+  var off=Math.round((t-b)/step)*step;
+  return b+off;
+}
+function nearestPhraseEdge(t){
+  var best=null,bd=1e9;
+  for(var i=0;i<phrases.length;i++){
+    var e=[phrases[i].a,phrases[i].b];
+    for(var k=0;k<2;k++){
+      var d=Math.abs(e[k]-t);
+      if(d<bd){bd=d;best=e[k];}
+    }
+  }
+  return (best!==null&&bd<localBeatLen(t)*2)?nearestBeatT(best):nearestBeatT(t);
+}
+function snapT(t){
+  if(snapMode==='bar')return nearestBar(t);
+  if(snapMode==='beat')return nearestBeatT(t);
+  if(snapMode==='half')return snapGrid(t,2);
+  if(snapMode==='quarter')return snapGrid(t,4);
+  if(snapMode==='phrase')return nearestPhraseEdge(t);
+  /* auto: a vocal spot snaps to where the words allow, otherwise the beat */
+  var pe=nearestPhraseEdge(t);
+  if(Math.abs(pe-t)<localBeatLen(t)*0.6&&cutOk(pe))return pe;
+  return nearestBeatT(t);
+}
 function mkChop(t,kindKey,auto,conf){
   var K=KIND[kindKey];
   return {t:t,kind:kindKey,unit:K.unit,count:K.count,mode:K.mode,auto:!!auto,conf:conf||0.5};
@@ -1651,7 +1730,23 @@ function updateChopCount(){
   into a hook, and there's a real transient to land on. Only high-confidence
   spots get used — everything else is left alone on purpose.
 */
+function reanalyze(){
+  /* everything downstream of the decoded audio is rebuilt from scratch */
+  if(!anMono){autoChop();return;}
+  analyzeVocalPhrases(anMono,anVBand,anSBand,anSr);
+  detectInstrumental();
+  if(lyricLines.length)applyLyrics();
+  detectFireLines();
+  buildSections();
+  if(anHat&&anSub)classifySong(anMono,anSr,anHat,anSub);
+  deriveSpeed();
+  autoChop();
+  drawWave();
+  updateChopCount();
+}
 function autoChop(){
+  styleP=styleParams();
+  var SP=styleP;
   pushUndo();
   chops=[]; selIdx=-1; $('editor').classList.add('hidden');
   if(barStarts.length<12){updateChopCount();drawWave();return;}
@@ -1862,7 +1957,12 @@ function autoChop(){
   for(i=0;i<cands.length;i++){
     var ac=arcAt(cands[i].bar);
     cands[i].arc=ac;
-    cands[i].raw*=(0.55+ac*0.85);
+    /* the style's instincts bend the whole candidate map */
+    var sw=(0.55+ac*0.85*SP.arc);
+    if(cands[i].cat==='beat')sw*=SP.beat; else sw*=SP.voc;
+    if(cands[i].beatKind==='flip')sw*=SP.flip;
+    if((cands[i].fire||0)>=0.55)sw*=SP.fire;
+    cands[i].raw*=sw;
   }
   /* never cut a word in half */
   for(i=0;i<cands.length;i++){
@@ -1908,8 +2008,8 @@ function autoChop(){
     else if(sec.type==='unknown')base=clamp(Math.round(sec.bars/4),2,Math.max(4,Math.round(sec.bars/4)));
     else if(sec.type==='inst')base=clamp(Math.round(sec.bars/6),1,Math.max(3,Math.round(sec.bars/6)));
     else return 0;
-    var b2=Math.round(base*density);
-    return clamp(b2,density<0.7?0:1,Math.round(base*Math.max(1,density)));
+    var b2=Math.round(base*density*SP.dens);
+    return clamp(b2,density*SP.dens<0.7?0:1,Math.round(base*Math.max(1,density*SP.dens)));
   }
   var picked=[]; secChopCount={};
   for(var si=0;si<sections.length;si++){
@@ -1920,8 +2020,15 @@ function autoChop(){
     for(i=0;i<pool.length;i++)if(pool[i].sec===sec2)inSec.push(pool[i]);
     inSec.sort(function(a,b){return b.raw-a.raw;});
     /* spacing inside a section: 2 bars normal, tighter when cranked */
-    var gapBars=density>=1.5?1:2;
+    var gapBars=(density*SP.dens)>=1.35?1:2;   /* a busy style may sit them a bar apart */
     var got=[];
+    /* how the style wants the section split between voices and drums */
+    var styleLean=Math.abs(SP.voc-SP.beat)/Math.max(SP.voc,SP.beat);
+    var quotaOn=styleLean>0.2;
+    var wantVocShare=SP.voc/(SP.voc+SP.beat);
+    var vocCap=quotaOn?Math.ceil(budget*clamp(wantVocShare+0.15,0.1,0.95)):999;
+    var beatCap=quotaOn?Math.ceil(budget*clamp(1-wantVocShare+0.15,0.1,0.95)):999;
+    var nVoc=0,nBeat=0;
     /* the run-up into a hook is reserved. Whatever else the section spends its
        budget on, the bars right before the hook get the move that sets it up. */
     var nextSec=(si+1<sections.length)?sections[si+1]:null;
@@ -1939,7 +2046,7 @@ function autoChop(){
           runBest=inSec[i];runBest.rb=bonus;
         }
       }
-      if(runBest)got.push(runBest);
+      if(runBest){got.push(runBest);if(runBest.cat==='vocal')nVoc++;else nBeat++;}
     }
     for(i=0;i<inSec.length&&got.length<budget;i++){
       var ok=true;
@@ -1963,7 +2070,14 @@ function autoChop(){
         }else if(Math.abs(got[p2].bar-inSec[i].bar)<gapBars||Math.abs(got[p2].t-inSec[i].t)<barLen()*0.9){ok=false;break;}
         if(got[p2].beatKind==='flip'&&inSec[i].beatKind==='flip'&&Math.abs(got[p2].bar-inSec[i].bar)<4){ok=false;break;}
       }
-      if(ok)got.push(inSec[i]);
+      if(ok){
+        /* respect the style's balance unless nothing else is left */
+        var isV=(inSec[i].cat==='vocal');
+        if(isV&&nVoc>=vocCap&&nBeat<beatCap)continue;
+        if(!isV&&nBeat>=beatCap&&nVoc<vocCap)continue;
+        if(isV)nVoc++;else nBeat++;
+        got.push(inSec[i]);
+      }
     }
     secChopCount[si]=got.length;
     for(i=0;i<got.length;i++)picked.push(got[i]);
@@ -1981,7 +2095,7 @@ function autoChop(){
     if(!used)bench.push(pool[i]);
   }
   /* rule 1: major vocal chops keep their distance (8-16s by density) */
-  var majorGap=clamp(15-5*density,8,16);
+  var majorGap=clamp(SP.gap-4*(density-1),6,22);
   var out1=[];
   for(i=0;i<picked.length;i++){
     var c1=picked[i];
@@ -2020,6 +2134,8 @@ function autoChop(){
        either side of a 20-second instrumental is not monotony */
     var span=out2[i].t-out2[i-2].t;
     if(span>barLen()*10)continue;
+    var lean=Math.abs(SP.voc-SP.beat)/Math.max(SP.voc,SP.beat);
+    if(lean>0.45&&i<out2.length-1&&out2[i+1].cat===out2[i].cat)continue;  /* the style wants this */
     if(out2[i].cat===out2[i-1].cat&&out2[i-1].cat===out2[i-2].cat){
       var wantCat=out2[i].cat==='vocal'?'beat':'vocal';
       var swapped=false;
@@ -2051,10 +2167,20 @@ function autoChop(){
   out2.sort(function(a,b){return a.t-b.t;});
   picked=out2;
   picked.sort(function(a,b){return a.t-b.t;});
+  /* final sweep: no two flips inside four bars, wherever they came from */
+  var lastFlipBar=-99, sweep=[];
+  for(i=0;i<picked.length;i++){
+    if(picked[i].beatKind==='flip'){
+      if(picked[i].bar-lastFlipBar<4){bench.push(picked[i]);continue;}
+      lastFlipBar=picked[i].bar;
+    }
+    sweep.push(picked[i]);
+  }
+  picked=sweep;
   /* top-up: if the take came out sparse (long sections, strict gates, drops
      along the way), pull the best remaining candidates back in — still
      respecting spacing, the per-bar cap, and vocal distance */
-  var wantMin=Math.max(6,Math.round(buf.duration/16*density));
+  var wantMin=Math.max(4,Math.round(buf.duration/16*density*SP.dens));
   if(picked.length<wantMin&&bench.length){
     bench.sort(function(a,b){return b.raw-a.raw;});
     for(var tb=0;tb<bench.length&&picked.length<wantMin;tb++){
@@ -2100,7 +2226,7 @@ function autoChop(){
       var arcK=pk.arc||0.5;
       /* a beat-category spot gets a beat-flavored chop, not a vocal repeat */
       var rB=rnd();
-      if(arcK>=0.9&&rB<0.55)kind=(rnd()<0.5)?'bar':'b2';   /* run-up: throw more */
+      if(arcK>=0.9&&rB<0.55*SP.big)kind=(rnd()<0.5)?'bar':'b2';   /* run-up: throw more */
       else if(arcK<=0.3&&rB<0.6)kind='snr';                /* calm: a light catch */
       else if(pk.drum>0.8&&rB<0.4)kind='snr';
       else if(pk.inst>0.5&&rB<0.6)kind='stb';
@@ -2219,7 +2345,7 @@ function autoChop(){
     return n;
   }
   var N=draft.length;
-  var want4=allot(N,0.01), want3=allot(N,0.04), want2=allot(N,0.25);
+  var want4=allot(N,0.01*SP.rpt), want3=allot(N,0.04*SP.rpt), want2=allot(N,0.25*SP.rpt);
   /* rank by how much each spot deserves a longer repeat */
   var order=[];
   for(i=0;i<N;i++){
@@ -2259,7 +2385,7 @@ function autoChop(){
     if(dd.kind==='flip'){
       /* span: one bar normally, two bars into a hook entry */
       var arcF=dd.pk.arc||0.5;
-      c.count=((arcF>=0.9&&rnd()<0.55)||(dd.pk.rise>0.18&&dd.pk.phrase>=0.8&&rnd()<0.4))?8:4;
+      c.count=((arcF>=0.9&&rnd()<0.55*SP.big)||(dd.pk.rise>0.18&&dd.pk.phrase>=0.8&&rnd()<0.4*SP.big))?8:4;
     }else{
       c.count=counts[i];
     }
@@ -2274,6 +2400,8 @@ function autoChop(){
   }
   lastTally=tally; lastRest=restedSection;
   critiqueChops();
+  scoreMix();
+  renderMixScore();
   updateChopCount();
   drawWave();
   writeReport(picked);
@@ -2386,6 +2514,115 @@ function writeReport(picked){
    four DJ instincts: is it dead on the beat, does it cut clean, is it crowding
    the chop before it, is the take getting monotonous. Anything that fails gets
    fixed if it can be and cut if it can't. */
+/* ---- mix score: what the critic thinks of the finished take ---- */
+var mixScore={total:0,notes:[],weak:[]};
+function scoreMix(){
+  var i,n=chops.length;
+  if(!n){mixScore={total:0,notes:[],weak:[]};return;}
+  var notes=[],weak=[];
+  /* beat alignment */
+  var onGrid=0,worst=0;
+  for(i=0;i<n;i++){
+    var d=Math.abs(chops[i].t-nearestBeatT(chops[i].t));
+    if(d<=0.004)onGrid++;
+    if(d>worst)worst=d;
+  }
+  var align=onGrid/n;
+  /* groove: spacing that neither crowds nor deserts */
+  var sorted=chops.slice().sort(function(a,b){return a.t-b.t;});
+  var gaps=[],tight=0;
+  for(i=1;i<n;i++){
+    var g=sorted[i].t-sorted[i-1].t;
+    gaps.push(g);
+    if(g<barLen()*0.9)tight++;
+  }
+  /* good groove is not even spacing — the tension arc makes it deliberately
+     uneven. What matters is that gaps stay musical (roughly one to eight bars)
+     and that nothing crowds what came before it. */
+  var musical=0, deserts=0;
+  for(i=0;i<gaps.length;i++){
+    var gb=gaps[i]/barLen();
+    if(gb>=0.9&&gb<=8)musical++;
+    if(gb>16)deserts++;
+  }
+  var inRange=gaps.length?musical/gaps.length:1;
+  var groove=clamp(inRange*0.9+0.1-tight/Math.max(1,n)*0.7-deserts/Math.max(1,gaps.length)*0.35,0,1);
+  /* variety */
+  var kinds={},cats={vocal:0,beat:0};
+  for(i=0;i<n;i++){
+    kinds[chops[i].kind]=(kinds[chops[i].kind]||0)+1;
+    cats[chops[i].cat||'beat']=(cats[chops[i].cat||'beat']||0)+1;
+  }
+  var nk=0;for(var k in kinds)if(kinds.hasOwnProperty(k))nk++;
+  var balance=1-Math.abs(cats.vocal-cats.beat)/n;
+  var variety=clamp(nk/6*0.6+balance*0.4,0,1);
+  /* how much of it is genuinely well-founded */
+  var conf=0,fireN=0;
+  for(i=0;i<n;i++){
+    conf+=(chops[i].conf||0.5)/n;
+    if((chops[i].fire||0)>=0.55)fireN++;
+    if((chops[i].conf||0.5)<0.78)weak.push(i);
+  }
+  /* density sanity against the song's own length */
+  var per=n/Math.max(1,buf.duration/60);
+  var densOk=clamp(1-Math.abs(per-7)/9,0,1);
+  var total=Math.round((align*0.26+groove*0.22+variety*0.16+conf*0.24+densOk*0.12)*100);
+  total=clamp(total,35,99);
+  if(align>=0.99)notes.push(['ok','Beat alignment: '+Math.round(align*100)+'%']);
+  else notes.push(['warn',Math.round((1-align)*n)+' chop(s) sit off the grid']);
+  if(groove>0.75)notes.push(['ok','Great groove — the spacing breathes']);
+  else if(tight)notes.push(['warn',tight+' chop(s) crowd the one before them']);
+  else notes.push(['warn','Long stretches with nothing happening']);
+  if(fireN)notes.push(['ok','Strong punchline chops ('+fireN+')']);
+  if(variety>0.6)notes.push(['ok',nk+' chop styles, vocal/beat balanced']);
+  else notes.push(['warn','Could use more variety between chop styles']);
+  if(lastTally.flip)notes.push(['ok',lastTally.flip+' turntable flips carrying the groove']);
+  if(weak.length)notes.push(['warn',weak.length+' chop(s) scored below 78 and could be improved']);
+  mixScore={total:total,notes:notes,weak:weak,align:align,groove:groove,variety:variety};
+}
+function renderMixScore(){
+  var el=$('mixScore');
+  if(!el)return;
+  if(!chops.length){el.classList.add('hidden');return;}
+  el.classList.remove('hidden');
+  var h='<div class="scoreTop"><span class="scoreNum">'+mixScore.total+'</span><span class="scoreOf">/100</span>'+
+        '<span class="scoreLbl">OVERALL MIX</span></div>';
+  for(var i=0;i<mixScore.notes.length;i++){
+    var nt=mixScore.notes[i];
+    h+='<div class="scoreLine '+(nt[0]==='ok'?'sOk':'sWarn')+'">'+(nt[0]==='ok'?'&#10003; ':'&#9888; ')+nt[1]+'</div>';
+  }
+  el.innerHTML=h+'<button id="optBtn" class="primary sm" style="margin-top:10px;width:100%;">Optimize Mix</button>';
+  $('optBtn').addEventListener('click',optimizeMix);
+}
+/* Optimize: take the critic seriously — rebuild the weak spots only */
+function optimizeMix(){
+  if(!chops.length)return;
+  pushUndo();
+  var before=chops.length, fixed=0;
+  scoreMix();
+  /* drop the weakest, re-snap everything, then let the planner refill the gaps */
+  var keep=[],trimmed=0;
+  for(var i=0;i<chops.length;i++){
+    var c=chops[i];
+    if(!c.auto){keep.push(c);continue;}
+    var was=c.t;
+    c.t=nearestBeatT(c.t);
+    if(Math.abs(was-c.t)>0.002)fixed++;
+    if((c.conf||0.5)<0.75){
+      /* try shortening it into something defensible before giving up on it */
+      if(c.mode==='norm'&&c.count>1){c.count=1;fixed++;keep.push(c);continue;}
+      if(c.mode==='norm'&&c.unit>0.5&&cutOk(c.t-c.unit*beatLen()/2)){c.unit=c.unit/2;fixed++;keep.push(c);continue;}
+      trimmed++;continue;
+    }
+    keep.push(c);
+  }
+  chops=keep;
+  fixed+=trimmed;
+  critiqueChops();
+  scoreMix();
+  updateChopCount();drawWave();renderMixScore();
+  setStatus('Optimized: '+fixed+' chop'+(fixed===1?'':'s')+' fixed or removed ('+before+' \u2192 '+chops.length+'), mix now '+mixScore.total+'/100.');
+}
 function critiqueChops(){
   var removed=0, adjusted=0, i;
   chops.sort(function(a,b){return a.t-b.t;});
@@ -2427,7 +2664,10 @@ function critiqueChops(){
        the next bar. That is a DJ move, not crowding — as long as the first
        chop has finished ringing before the second lands. */
     if(cur.lead&&(prev.fire||0)>=0.6&&cur.t-prev.t>=ext+beatLen()*0.5)continue;
-    if(cur.t-prev.t<ext+barLen()*0.8){
+    /* how much room a chop needs is a matter of taste: an aggressive take
+       tolerates them closer, a minimal one wants air */
+    var room=barLen()*clamp(0.8/(styleP?styleP.dens:1),0.35,1.6);
+    if(cur.t-prev.t<ext+room){
       if(cur.auto&&(!prev.auto||(cur.conf||0.5)<=(prev.conf||0.5))){chops.splice(i,1);}
       else{chops.splice(i-1,1);i--;}
       removed++;
@@ -2575,13 +2815,22 @@ function makeChain(ctx){
   comp.threshold.value=-14;comp.ratio.value=3;comp.attack.value=0.006;comp.release.value=0.22;
   var master=ctx.createGain();master.gain.value=0.92;
   input.connect(bass);bass.connect(sub);sub.connect(lp);lp.connect(comp);comp.connect(master);
+  var echoSend=null;
   if(fx.echo.on&&fx.echo.val>0){
     var dl=ctx.createDelay(2.5);
     var dt=beatLen()/speed*0.75;if(dt>2.4)dt=2.4;
     dl.delayTime.value=dt;
     var fb=ctx.createGain();fb.gain.value=0.34;
     var wet=ctx.createGain();wet.gain.value=fx.echo.val/100;
+    /* the echo now has its own send, so only the chops feed it — a real screw
+       tape does not smear the whole record, it trails the repeats */
+    echoSend=ctx.createGain();echoSend.gain.value=0;
+    echoSend.connect(dl);
     lp.connect(dl);dl.connect(fb);fb.connect(dl);dl.connect(wet);wet.connect(comp);
+    if(aiFx){
+      /* drop the always-on path and feed the delay from the send alone */
+      try{lp.disconnect(dl);}catch(e){}
+    }
   }
   if(fx.rev.on&&fx.rev.val>0){
     var cv=ctx.createConvolver();cv.buffer=makeImpulse(ctx);
@@ -2589,7 +2838,7 @@ function makeChain(ctx){
     lp.connect(cv);cv.connect(rw);rw.connect(comp);
   }
   master.connect(ctx.destination);
-  return {input:input,master:master};
+  return {input:input,master:master,echoSend:echoSend,bass:bass,sub:sub};
 }
 function scheduleAll(ctx,chain,fromT,when,stopAt){
   var segs=buildSegments(fromT);
@@ -2600,7 +2849,18 @@ function scheduleAll(ctx,chain,fromT,when,stopAt){
   var wob=null,wg=null;
   if(fx.wob.on&&fx.wob.val>0){
     wob=ctx.createOscillator();wob.frequency.value=2.6;
-    wg=ctx.createGain();wg.gain.value=rate*0.014*(fx.wob.val/100);
+    wg=ctx.createGain();
+    var wPk=rate*0.014*(fx.wob.val/100);
+    if(aiFx){
+      /* tape wobble comes and goes like a tired belt, it does not hum all day */
+      wg.gain.setValueAtTime(wPk*0.15,when);
+      var wt=when+4;
+      var on=true;
+      while(wt<when+600){
+        wg.gain.linearRampToValueAtTime(on?wPk:wPk*0.12,wt);
+        wt+=6+Math.random()*12; on=!on;
+      }
+    }else wg.gain.value=wPk;
     wob.connect(wg);wob.start(when);
   }
   for(var i=0;i<segs.length;i++){
@@ -2622,6 +2882,16 @@ function scheduleAll(ctx,chain,fromT,when,stopAt){
     gn.gain.setValueAtTime(pk,t+od-fd);
     gn.gain.linearRampToValueAtTime(0.0001,t+od);
     src.connect(gn);gn.connect(chain.input);
+    if(aiFx&&chain.echoSend&&sg.rep){
+      /* this segment IS a repeat — send it to the delay and let it trail off */
+      var es=ctx.createGain();
+      es.gain.setValueAtTime(0.0001,t);
+      es.gain.linearRampToValueAtTime(1,t+fd);
+      es.gain.setValueAtTime(1,t+od-fd);
+      es.gain.linearRampToValueAtTime(0.0001,t+od+0.05);
+      gn.connect(es);es.connect(chain.echoSend);
+      chain.echoSend.gain.setValueAtTime(1,t);
+    }
     src.start(t,off,len);
     srcs.push(src);
     entries.push({at:t,dur:od,s:sg.s,e:sg.e,rev:sg.rev});
@@ -2643,9 +2913,35 @@ function scheduleAll(ctx,chain,fromT,when,stopAt){
   if(fx.crk.on&&fx.crk.val>0){
     var ck=ctx.createBufferSource();
     ck.buffer=makeCrackle(ctx);ck.loop=true;
-    var cg=ctx.createGain();cg.gain.value=fx.crk.val/100*1.6;
+    var cg=ctx.createGain();
+    var base=fx.crk.val/100*1.6;
+    if(aiFx&&sections.length&&entries.length){
+      /* vinyl noise belongs at the edges of a record, not under the hook */
+      cg.gain.setValueAtTime(base*1.5,when);
+      for(var ei=0;ei<entries.length;ei+=2){
+        var en=entries[ei], sc3=sectionAt(barIndexAt(en.s));
+        var lvl=base*0.28;
+        if(sc3&&(sc3.type==='intro'||sc3.type==='outro'))lvl=base*1.6;
+        else if(sc3&&sc3.type==='inst')lvl=base*0.8;
+        cg.gain.linearRampToValueAtTime(lvl,when+en.at-when+0.001);
+      }
+    }else cg.gain.value=base;
     ck.connect(cg);cg.connect(chain.master);
     ck.start(when);ck.stop(t+0.2);srcs.push(ck);
+  }
+  /* bass lift breathes with the song instead of sitting flat */
+  if(aiFx&&chain.bass&&entries.length&&barEnergy){
+    var bBase=fx.bass.on?fx.bass.val:0;
+    if(bBase>0){
+      chain.bass.gain.setValueAtTime(bBase,when);
+      for(var bj=0;bj<entries.length;bj+=3){
+        var e2=entries[bj], bi3=barIndexAt(e2.s);
+        var eV=(bi3>=0&&bi3<barEnergy.length)?barEnergy[bi3]:0.5;
+        var g2=bBase*(0.8+clamp(eV,0,1)*0.5);
+        chain.bass.gain.linearRampToValueAtTime(g2,when+e2.at-when+0.001);
+        if(chain.sub)chain.sub.gain.linearRampToValueAtTime(g2*0.5,when+e2.at-when+0.001);
+      }
+    }
   }
   return {entries:entries,srcs:srcs,osc:wob,endAt:t};
 }
@@ -2830,7 +3126,7 @@ function applyVibe(v,silent){
   var els=document.querySelectorAll('.vibe');
   for(var i=0;i<els.length;i++)els[i].className=els[i].dataset.v===v?'vibe on':'vibe';
   var dn=density>=1.5?'Lots':(density<=0.6?'Few':'Normal');
-  $('densBtn').textContent='Chop amount: '+dn;
+  $('densBtn').textContent='Groove: '+grooveName();
   if(!silent)autoChop();
 }
 function syncFxUI(){
@@ -3081,22 +3377,42 @@ $('pitchBtn').addEventListener('click',function(){
   this.textContent=preservePitch?'Pitch: Preserved (same key)':'Pitch: Deep (real screw)';
   this.className=preservePitch?'grow on':'grow';
 });
-$('autoBtn').addEventListener('click',function(){stop(true);autoChop();setStatus(chops.length+' chops placed.');});
-$('undoBtn').addEventListener('click',function(){
-  if(!undoStack.length){setStatus('Nothing to undo.');return;}
-  chops=JSON.parse(undoStack.pop());
-  closeEditor();updateChopCount();drawWave();setStatus('Undone.');
+$('autoBtn').addEventListener('click',function(){
+  if(!buf)return;
+  /* a real re-analysis: the phrase map, the fire lines, the structure and the
+     chop plan are all rebuilt, with a fresh seed so the AI makes new calls */
+  pushUndo();
+  seed=Math.floor(Math.random()*1e9);
+  stop(true);
+  setStatus('Re-analyzing the song...');
+  var self=this;
+  setTimeout(function(){
+    try{
+      reanalyze();
+      setStatus('New read on the song: '+chops.length+' chops, '+STYLES[chopStyle].name+'.');
+    }catch(e){
+      setStatus('Re-analysis hit a problem — kept the previous mix.');
+    }
+  },30);
 });
 $('clearBtn').addEventListener('click',function(){pushUndo();chops=[];closeEditor();updateChopCount();drawWave();});
 $('densBtn').addEventListener('click',function(){
   density=density>=1.5?0.5:(density<=0.6?1:1.8);
-  this.textContent='Chop amount: '+(density>=1.5?'Lots':(density<=0.6?'Few':'Normal'));
+  this.textContent='Groove: '+grooveName();
   autoChop();
 });
 $('snapBtn').addEventListener('click',function(){
-  snapBar=!snapBar;
-  this.textContent='Snap: '+(snapBar?'Bar':'Beat');
-  this.className=snapBar?'grow on':'grow';
+  var i=SNAPS.indexOf(snapMode);
+  snapMode=SNAPS[(i+1)%SNAPS.length];
+  this.textContent='Snap: '+SNAP_NAMES[snapMode];
+  this.className=snapMode==='auto'?'grow':'grow on';
+});
+$('styleBtn').addEventListener('click',function(){
+  var i=STYLE_ORDER.indexOf(chopStyle);
+  chopStyle=STYLE_ORDER[(i+1)%STYLE_ORDER.length];
+  this.textContent='Style: '+STYLES[chopStyle].name;
+  this.className=chopStyle==='classic'?'grow':'grow on';
+  if(buf){autoChop();setStatus(STYLES[chopStyle].name+' — chops rebuilt with that approach.');}
 });
 $('addMode').addEventListener('click',function(){
   addChopMode=!addChopMode;
