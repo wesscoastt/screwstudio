@@ -8,7 +8,15 @@
 <title>SCREW STUDIO</title>
 <link rel="manifest" href="manifest.json">
 <link rel="apple-touch-icon" href="icon-180.png">
+<link rel="apple-touch-icon" sizes="180x180" href="icon-180.png">
+<link rel="apple-touch-icon" sizes="192x192" href="icon-192.png">
+<link rel="apple-touch-icon" sizes="512x512" href="icon-512.png">
+<link rel="icon" type="image/png" sizes="512x512" href="icon-512.png">
 <meta name="theme-color" content="#0d0813">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Screw Studio">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Archivo+Black&family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
 <style>
@@ -57,6 +65,35 @@ button:disabled{opacity:0.35;}
 .scoreLine{font-size:12px;line-height:1.7;color:#cfc4e4;}
 .sOk{color:#7fd4c1;}
 .sWarn{color:#ffb84d;}
+.ver{position:fixed;right:8px;bottom:6px;font-size:9px;letter-spacing:1px;
+  color:#4a4266;font-family:'Space Grotesk',sans-serif;z-index:60;pointer-events:none;}
+
+/* ---- landscape on a phone ----
+   Turned sideways the screen is wide and short, so stack nothing: put the
+   waveform and transport down the left where the thumbs are, and give the
+   panels their own scrolling column on the right. Everything stays reachable
+   without hunting, and the wave gets the width it deserves. */
+@media (orientation:landscape) and (max-height:560px){
+  body{padding:8px 10px 10px;}
+  .wrap{max-width:none;}
+  h1{font-size:26px;letter-spacing:1px;margin:0;}
+  .sub{font-size:8px;letter-spacing:3px;margin-bottom:6px;}
+  .land{display:flex;gap:12px;align-items:flex-start;}
+  .landL{flex:1 1 58%;min-width:0;position:sticky;top:0;}
+  .landR{flex:1 1 42%;min-width:0;max-height:calc(100vh - 24px);
+         overflow-y:auto;-webkit-overflow-scrolling:touch;padding-right:2px;}
+  .landR::-webkit-scrollbar{width:4px;}
+  .landR::-webkit-scrollbar-thumb{background:#3a2f5c;border-radius:2px;}
+  #wave{height:132px;}
+  .stats{gap:6px;}
+  .stat{padding:6px 4px;}
+  .statV{font-size:16px;}
+  .statL{font-size:7px;}
+  .drop{padding:14px 10px;}
+  .panel{padding:10px;margin-bottom:8px;}
+  button{min-height:38px;}
+  .ver{bottom:3px;right:5px;}
+}
 #wave{width:100%;height:172px;display:block;border-radius:8px;touch-action:none;}
 #pos{position:absolute;top:12px;right:16px;font-size:11px;color:var(--cream);font-variant-numeric:tabular-nums;pointer-events:none;}
 .hint{font-size:11px;color:var(--dim);margin-top:8px;text-align:center;line-height:1.5;}
@@ -98,8 +135,11 @@ a.dl{display:block;text-align:center;margin-top:10px;color:var(--purple);font-we
 <header>
   <div class="title">SCREW<span>&nbsp;STUDIO</span></div>
   <div class="sub">Created by Wesscoastt</div>
+  <div class="ver" id="verTag">v14</div>
 </header>
 
+<div class="land">
+<div class="landL">
 <div id="drop">
   <b>Drop a song here</b>
   MP3 &middot; WAV &middot; M4A &middot; FLAC &middot; AAC
@@ -128,6 +168,7 @@ a.dl{display:block;text-align:center;margin-top:10px;color:var(--purple);font-we
   </div>
   <div class="hint" id="waveHint">Tap the wave to jump. Chop markers can be dragged.</div>
 </div>
+</div><div class="landR">
 
 <div class="panel hidden" id="editor">
   <div class="row" style="justify-content:space-between;">
@@ -315,6 +356,7 @@ var actx=null, buf=null, revBuf=null, fileName='track';
 var bpm=0, beats=[], barStarts=[], keyName='--';
 var onsetFlux=null, fluxHop=512;
 var barEnergy=null, barVocal=null, barBass=null, barOnset=null, barHat=null, barMid=null;
+var APP_VERSION='14';
 var gridDrift={moved:0,avg:0};
 var aiFx=true;
 var anMono=null,anVBand=null,anSBand=null,anHat=null,anSub=null,anSr=44100;
@@ -4414,6 +4456,7 @@ fxWire('fxWobB','fxWob','wob');
 syncFxUI();
 $('expBtn').addEventListener('click',function(){doExport('wav','expBtn','expOut2');});
 $('expMp3Btn').addEventListener('click',function(){doExport('mp3','expMp3Btn','expOut2');});
+if($('verTag'))$('verTag').textContent='v'+APP_VERSION;
 window.addEventListener('resize',function(){if(buf)drawWave();});
 if('serviceWorker' in navigator){
   window.addEventListener('load',function(){
@@ -4421,5 +4464,6 @@ if('serviceWorker' in navigator){
   });
 }
 </script>
+</div></div>
 </body>
 </html>
