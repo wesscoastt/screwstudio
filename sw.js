@@ -1,5 +1,5 @@
 /* Screw Studio service worker — bump CACHE_VERSION every time index.html changes */
-var CACHE_VERSION = 'screwstudio-v14';
+var CACHE_VERSION = 'screwstudio-v15';
 var CORE = ['./', './index.html', './manifest.json', './icon-180.png', './icon-192.png', './icon-512.png', './icon-1024.png'];
 
 self.addEventListener('install', function (e) {

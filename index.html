@@ -135,7 +135,7 @@ a.dl{display:block;text-align:center;margin-top:10px;color:var(--purple);font-we
 <header>
   <div class="title">SCREW<span>&nbsp;STUDIO</span></div>
   <div class="sub">Created by Wesscoastt</div>
-  <div class="ver" id="verTag">v14</div>
+  <div class="ver" id="verTag">v15</div>
 </header>
 
 <div class="land">
@@ -194,6 +194,8 @@ a.dl{display:block;text-align:center;margin-top:10px;color:var(--purple);font-we
       <option value="scr">Baby scratch</option>
       <option value="rew">Rewind (spin-back)</option>
       <option value="drg">Record drag</option>
+      <option value="hold">Stop-time hold</option>
+      <option value="hold">Stop-time hold</option>
       <option value="scr">Baby scratch</option>
       <option value="rew">Rewind (spin-back)</option>
       <option value="drg">Record drag</option>
@@ -356,7 +358,7 @@ var actx=null, buf=null, revBuf=null, fileName='track';
 var bpm=0, beats=[], barStarts=[], keyName='--';
 var onsetFlux=null, fluxHop=512;
 var barEnergy=null, barVocal=null, barBass=null, barOnset=null, barHat=null, barMid=null;
-var APP_VERSION='14';
+var APP_VERSION='15';
 var gridDrift={moved:0,avg:0};
 var aiFx=true;
 var anMono=null,anVBand=null,anSBand=null,anHat=null,anSub=null,anSr=44100;
@@ -400,7 +402,8 @@ var KIND={
   flip:{unit:1, count:4,mode:'flip',name:'turntable flip',cat:'beat'},
   scr:{unit:0.5, count:2,mode:'scratch',name:'baby scratch',cat:'beat'},
   rew:{unit:2,   count:1,mode:'rewind', name:'rewind',cat:'beat'},
-  drg:{unit:1,   count:1,mode:'drag',   name:'record drag',cat:'beat'}
+  drg:{unit:1,   count:1,mode:'drag',   name:'record drag',cat:'beat'},
+  hold:{unit:1,  count:1,mode:'hold',   name:'stop-time hold',cat:'beat'}
 };
 var lastTally={1:0,2:0,3:0,4:0,flip:0}, lastRest=-1, lastCrit={removed:0,adjusted:0};
 var fx={
@@ -1280,6 +1283,27 @@ function sectionAt(bar){
   for(var i=0;i<sections.length;i++)if(bar>=sections[i].a&&bar<sections[i].b)return sections[i];
   return sections.length?sections[sections.length-1]:null;
 }
+/* ---- the pocket ----
+   A screw tape sits around 60-70 BPM. A flat percentage does not get you
+   there: 36% off a 140 BPM trap record lands somewhere else entirely, and the
+   same percentage off a record that was already slow turns it to sludge. So
+   aim at the tempo, not at the percentage, and treat a fast record as the
+   half-time it is actually felt in. */
+function aimForPocket(sp){
+  if(!bpm)return sp;
+  var felt=(bpm>=118)?bpm/2:bpm;
+  /* a record that is already slow only needs a nudge — screwing it hard just
+     makes it fall apart */
+  if(felt<74){
+    /* it is already where a screw tape lives. The genre reading has no
+       business dragging it further down — hold the floor at about 58. */
+    return clamp(60/felt,0.80,0.95);
+  }
+  var want=clamp(66/felt,0.50,0.80);
+  /* the genre reading still colours it, the tempo just decides the region */
+  var blended=sp*0.3+want*0.7;
+  return clamp(blended,0.50,0.82);
+}
 function deriveSpeed(){
   /* Speed is a musical decision, not a constant. Genre sets the range,
      then delivery, beat density, energy and emotional tone place it inside. */
@@ -1289,7 +1313,7 @@ function deriveSpeed(){
     else if(bpm<74){lo=0.65;hi=0.70;why='very slow instrumental';}
     else{lo=0.57;hi=0.66;why='instrumental';}
     var posI=clamp(0.40+clamp(C.dens*1.3,0,1)*0.35+clamp(C.energy,0,1)*0.25-C.emo*0.25,0,1);
-    derivedSpeed=clamp(lo+posI*(hi-lo),0.52,0.74);
+    derivedSpeed=aimForPocket(clamp(lo+posI*(hi-lo),0.52,0.74));
     mixNotes=[];
     mixNotes.push('Tempo '+bpm+' BPM'+(bpm>120?' (half-time feel, ~'+Math.round(C.eff)+')':'')+' in '+keyName+'.');
     mixNotes.push('Read this as an '+why+' — only '+Math.round(instStats.frac*100)+
@@ -1310,6 +1334,7 @@ function deriveSpeed(){
   var enN=clamp(C.energy,0,1);
   var pos=clamp(0.42+sylN*0.34+densN*0.20+enN*0.10-C.emo*0.34,0,1);
   derivedSpeed=clamp(lo+pos*(hi-lo),0.52,0.74);
+  derivedSpeed=aimForPocket(derivedSpeed);
   mixNotes=[];
   mixNotes.push('Tempo '+bpm+' BPM'+(bpm>120?' (half-time feel, ~'+Math.round(C.eff)+')':'')+' in '+keyName+
     (C.minor?' — minor key, so I read it as heavier.':'.'));
@@ -1914,6 +1939,7 @@ function drawWave(playT){
   g.fillStyle='#fff';g.fillRect(phx-1,top,2,wh);
 }
 function glyph(c){
+  if(c.mode==='hold')return'HOLD';
   if(c.mode==='scratch')return'SCR';
   if(c.mode==='rewind')return'REW';
   if(c.mode==='drag')return'DRAG';
@@ -2493,7 +2519,7 @@ function autoChop(quiet){
   var moveCount=0, lastMoveBar=-99, mv2=[];
   for(i=0;i<picked.length;i++){
     var bk=picked[i].beatKind;
-    if(bk==='rew'||bk==='drg'||bk==='scr'){
+    if(bk==='rew'||bk==='drg'||bk==='scr'||bk==='hold'){
       if(moveCount>=3||picked[i].bar-lastMoveBar<8){bench.push(picked[i]);continue;}
       moveCount++;lastMoveBar=picked[i].bar;
     }
@@ -2813,6 +2839,9 @@ function writeReport(picked){
     if(picked[i].beatKind==='rew')rwN++;
     if(picked[i].beatKind==='drg')dgN++;
   }
+  var hdN=0;
+  for(i=0;i<chops.length;i++)if(chops[i].kind==='hold')hdN++;
+  if(hdN)line(hdN+' stop-time hold'+(hdN>1?'s':'')+' — the beat drops out for a moment and falls back in on the downbeat. The silence is the effect.');
   if(rwN)line(rwN+' rewind'+(rwN>1?'s':'')+' — the record yanked back and dropped in on the downbeat, the old way into a hook.');
   if(dgN)line(dgN+' record drag'+(dgN>1?'s':'')+' leaning into a section change.');
   if(scN)line(scN+' baby scratch'+(scN>1?'es':'')+' over the drums, placed where no words are in the way.');
@@ -2998,7 +3027,7 @@ function validateChop(c,idx,sorted){
   /* a quarter or half beat stutter is supposed to sound like a fragment —
      that is the effect. The glitch rule is about repeating a whole beat or bar
      that begins in the middle of a held note. */
-  var gesture=(c.mode==='scratch'||c.mode==='rewind'||c.mode==='drag');
+  var gesture=(c.mode==='scratch'||c.mode==='rewind'||c.mode==='drag'||c.mode==='hold');
   var shortMat=gesture||(c.mode!=='flip'&&c.unit<=0.5);
   var glitch=shortMat?1:((art<0.14&&rest<0.55)?0.62:(art<0.14?0.82:1));
   if(gesture){
@@ -3429,7 +3458,10 @@ function addTurntableMoves(){
     var t=barStarts[sec.a];
     if(!roomAt(t)||!vocalClear(t-barLen()))continue;
     if(rnd()>0.72)continue;                  /* not every hook — that is a pattern */
-    var c=mkChop(nearestBeatT(t),'rew',true,0.93);
+    /* two ways into a hook: yank the record back, or stop it dead and let it
+       fall in. Pick one — doing both at the same door is a pile-up. */
+    var entry=(rnd()<0.38)?'hold':'rew';
+    var c=mkChop(nearestBeatT(t),entry,true,0.93);
     c.cat='beat';c.count=1;c.vscore=90;
     chops.push(c);used.push(t);placed++;
   }
@@ -3561,7 +3593,7 @@ function critiqueChops(){
     if(!chops[i-1].auto)continue;
     var mk3=chops[i-1].kind;
     /* never rewrite a deliberate hand move into an ordinary repeat */
-    if(mk3==='rew'||mk3==='drg'||mk3==='scr'||mk3==='flip')continue;
+    if(mk3==='rew'||mk3==='drg'||mk3==='scr'||mk3==='hold'||mk3==='flip')continue;
     if(chops[i].kind===chops[i-1].kind&&chops[i-1].kind===chops[i-2].kind&&chops[i].kind!=='flip'){
       var alt=chops[i-1].kind==='b1'?'h2':(chops[i-1].kind==='h2'?'b1':(chops[i-1].cat==='beat'?'snr':'b1'));
       var K=KIND[alt];
@@ -3610,6 +3642,18 @@ function buildSegments(fromT){
         segs.push({s:fb,e:fe,rev:false,rep:false,g:1});
         segs.push({s:fb,e:fe,rev:false,rep:true,g:clamp(jg,0.9,1.1)});
       }
+      pos=c.t;
+      continue;
+    }
+    if(c.mode==='hold'){
+      /* stop-time: everything drops out for a beat and the record falls back
+         in on the downbeat. The silence is the effect — nothing is repeated. */
+      var hL=c.unit*bl, h0=c.t-hL;
+      if(h0<=pos+0.02)continue;
+      segs.push({s:pos,e:h0,rev:false,rep:false,g:1});
+      /* the tail of the last hit rings out and stops */
+      segs.push({s:h0,e:h0+hL*0.30,rev:false,rep:true,g:1,fadeOut:true});
+      segs.push({s:h0,e:h0+0.001,rev:false,rep:true,g:0,silence:hL*0.70});
       pos=c.t;
       continue;
     }
@@ -3822,10 +3866,22 @@ function scheduleAll(ctx,chain,fromT,when,stopAt){
     if(off<0){len+=off;off=0;}
     if(len<=0.005)continue;
     var od=len/rate, fd=Math.min(FADE,od/3), pk=sg.g;
+    /* a stop-time hold is silence with the clock still running: nothing plays,
+       but the timeline advances so the record falls back in on the downbeat */
+    if(sg.silence){
+      t+=sg.silence/rate;      /* the clock runs on; nothing is scheduled */
+      continue;
+    }
     gn.gain.setValueAtTime(0.0001,t);
     gn.gain.linearRampToValueAtTime(pk,t+fd);
-    gn.gain.setValueAtTime(pk,t+od-fd);
-    gn.gain.linearRampToValueAtTime(0.0001,t+od);
+    if(sg.fadeOut){
+      /* the last hit rings out and stops rather than being cut off */
+      gn.gain.setValueAtTime(pk,t+fd);
+      gn.gain.exponentialRampToValueAtTime(0.0008,t+od);
+    }else{
+      gn.gain.setValueAtTime(pk,t+od-fd);
+      gn.gain.linearRampToValueAtTime(0.0001,t+od);
+    }
     src.connect(gn);gn.connect(chain.input);
     if(aiFx&&chain.echoSend&&sg.rep){
       /* this segment IS a repeat — send it to the delay and let it trail off */
